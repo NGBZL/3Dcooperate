@@ -89,6 +89,12 @@ def _build_summary_markdown(result: dict[str, Any]) -> str:
     if result.get("error"):
         lines += ["", f"> ⚠️ 审核未能完成：{result['error']}"]
 
+    failed = result.get("failed_issues") or []
+    if failed:
+        lines += ["", "> ⚠️ 以下 Issue 处理失败（多半是提交信息里的编号写错了）："]
+        for item in failed:
+            lines.append(f"> - #{item.get('issue')}：{item.get('error')}")
+
     handled = result.get("handled") or []
     if handled:
         lines += ["", "| Issue | 留评语 | 标签改 done | 已关闭 | 备注 |", "|---|---|---|---|---|"]
@@ -130,6 +136,8 @@ def _print_result(result: dict[str, Any]) -> None:
             print(f"  · Issue #{item['issue']}（演练模式，未写入 GitHub）")
         elif item.get("skipped"):
             print(f"  · Issue #{item['issue']} 跳过：{item.get('reason', '')}")
+        if item.get("error"):
+            print(f"  · Issue #{item['issue']} 处理失败：{item['error']}")
         else:
             print(f"  · Issue #{item['issue']} 评论={'✅' if item.get('commented') else '—'} "
                   f"done={'✅' if item.get('labels_updated') else '—'} "
@@ -233,6 +241,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     # LLM 调用失败时返回非 0，让 Actions 变红引起注意（此时只留了“审核未完成”评论，未改 Issue 状态）
     if result.get("error"):
         logger.error("审核未能完成：%s", result["error"])
+        return 1
+
+    # 有 Issue 处理失败（最常见的：提交信息里的编号不存在）也返回非 0，
+    # 但要明确：其它 Issue 的报告已经正常发出，不是白跑
+    failed = result.get("failed_issues") or []
+    if failed:
+        logger.error("有 %d 个 Issue 处理失败：%s",
+                     len(failed), "、".join(f"#{item['issue']}" for item in failed))
         return 1
 
     return 0

@@ -183,6 +183,7 @@ class FakeGitHub:
     :param marker_sha: 评论里标记的 commit sha
     :param raw_diff: 以 vnd.github.diff 媒体类型请求时返回的原始 diff
                      （用于模拟“GitHub 省略了 files[].patch”的场景）
+    :param missing_issues: 这些 Issue 编号一律返回 404（模拟提交信息里写错编号）
     """
 
     def __init__(
@@ -194,6 +195,7 @@ class FakeGitHub:
         reviewed_issues: Optional[set[int]] = None,
         marker_sha: str = "b" * 40,
         raw_diff: str = "",
+        missing_issues: Optional[set[int]] = None,
     ) -> None:
         self.files = files
         self.message = message
@@ -202,6 +204,7 @@ class FakeGitHub:
         self.reviewed_issues = reviewed_issues
         self.marker_sha = marker_sha
         self.raw_diff = raw_diff
+        self.missing_issues = set(missing_issues or ())
         self.calls: list[dict[str, Any]] = []
 
     # -- 与真实 _request 保持同样的契约：非 allow 的状态码抛 ReviewError --
@@ -233,6 +236,15 @@ class FakeGitHub:
         self, method: str, path: str, json_body: Optional[dict[str, Any]] = None
     ) -> tuple[int, Any]:
         """根据路径分发预制响应。"""
+        # 编号写错的场景：这些 Issue 的一切请求都返回 404
+        if self.missing_issues and "/issues/" in path:
+            try:
+                number = int(path.split("/issues/")[1].split("/")[0])
+            except (IndexError, ValueError):
+                number = -1
+            if number in self.missing_issues:
+                return 404, {"message": "Not Found"}
+
         if "/compare/" in path:
             return 200, {"files": self.files, "total_commits": 1, "status": "ahead"}
         if "/commits/" in path:
@@ -741,14 +753,49 @@ def test_missing_patch_fallback() -> None:
     check("有 patch 时正常审核", result.get("skipped") is False and len(llm.calls) == 1, result)
 
 
+def test_bad_issue_number() -> None:
+    """
+    提交信息里写了不存在的 Issue 编号时，不能连累其它 Issue。
+
+    真实场景：`git commit -m "fix: 修好了 #99"` 但 #99 不存在（或是个 PR）。
+    旧代码会在花掉 token 之后整个运行失败，其它正常 Issue 连评论都拿不到。
+    """
+    print("[9] 编号写错时的容错")
+
+    # 9.1 #1 正常、#99 不存在
+    fake = FakeGitHub([make_diff_file()], "feat: x\n\n#1 #99",
+                      reviewed_issues=set(), missing_issues={99})
+    llm = FakeLLM(passed=True, score=80)
+    reviewer = make_reviewer(fake, llm)
+    result = reviewer.review("a" * 40, "b" * 40)
+
+    check("整体没有崩", result.get("skipped") is False, result)
+    check("仍然只调用 1 次 LLM", len(llm.calls) == 1, len(llm.calls))
+    handled = {item["issue"]: item for item in result["handled"]}
+    check("正常的 #1 照常评论", handled[1]["commented"] is True, handled[1])
+    check("正常的 #1 照常改标签并关闭",
+          handled[1]["labels_updated"] is True and handled[1]["closed"] is True, handled[1])
+    check("#99 被记为失败", [f["issue"] for f in result["failed_issues"]] == [99], result["failed_issues"])
+    check("#99 不会留下评论/状态变更",
+          handled[99]["commented"] is False and handled[99]["closed"] is False, handled[99])
+    check("失败项带上原因", "404" in handled[99].get("error", ""), handled[99])
+    check("提示词里说明了 #99 获取失败", "#99" in llm.calls[0][1], llm.calls[0][1][:200])
+    check("#1 仍然收到了评论", fake.called("POST", "/issues/1/comments"), fake.calls)
+
+    # 9.2 run.py 的摘要要提醒这件事，并让 Actions 变红
+    agent_run = _load_run_module()
+    markdown = agent_run._build_summary_markdown(result)
+    check("摘要提醒 Issue 处理失败", "处理失败" in markdown and "#99" in markdown, markdown[-200:])
+
+
 # ============================================================
-# 9. 入口脚本
+# 10. 入口脚本
 # ============================================================
 
 
 def test_run_entry() -> None:
     """测试 run.main 的退出码与摘要生成。"""
-    print("[9] 入口脚本 run.main")
+    print("[10] 入口脚本 run.main")
 
     # 延迟导入：即使 agent/run.py 被写坏，前面的编码体检也能先给出清晰提示
     agent_run = _load_run_module()
@@ -855,6 +902,7 @@ def main() -> int:
     test_review_paths()
     test_token_cost()
     test_missing_patch_fallback()
+    test_bad_issue_number()
     test_run_entry()
 
     print()

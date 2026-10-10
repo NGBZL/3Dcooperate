@@ -754,7 +754,8 @@ class CodeReviewer:
             "commit": short,
             "handled": [],
             "error": None,
-            "deduped": False,   # True 表示因“已审核过”而短路（没有调用 LLM）
+            "deduped": False,       # True 表示因“已审核过”而短路（没有调用 LLM）
+            "failed_issues": [],    # 处理失败的 Issue（例如编号写错、不存在）
         }
 
         logger.info("=" * 56)
@@ -842,19 +843,41 @@ class CodeReviewer:
                     "✅ 通过" if summary["passed"] else "❌ 不通过", summary["score"])
 
         # ---- 6. 逐个 Issue 处理 ----
+        # 单个 Issue 失败（最常见：提交信息里的编号写错/不存在）只影响它自己，
+        # 不能让其它关联 Issue 连评论都拿不到 —— token 已经花了，报告要尽量送到。
         for number in issue_numbers:
-            summary["handled"].append(
-                self._handle_issue(
-                    number,
-                    result,
-                    commit_message=commit_message,
-                    commit_title=commit_title,
-                    commit_sha=after_sha,
-                    stats=stats,
-                    dry_run=dry,
-                    force=force,
+            try:
+                summary["handled"].append(
+                    self._handle_issue(
+                        number,
+                        result,
+                        commit_message=commit_message,
+                        commit_title=commit_title,
+                        commit_sha=after_sha,
+                        stats=stats,
+                        dry_run=dry,
+                        force=force,
+                    )
                 )
-            )
+            except ReviewError as exc:
+                logger.error("Issue #%s 处理失败（其余 Issue 不受影响）：%s", number, exc.message)
+                summary["failed_issues"].append({"issue": number, "error": exc.message})
+                summary["handled"].append(
+                    {"issue": number, "commented": False, "closed": False,
+                     "labels_updated": False, "skipped": False, "error": exc.message}
+                )
+            except Exception as exc:  # noqa: BLE001 - 兜底，绝不让一个 Issue 打断整轮
+                logger.exception("Issue #%s 处理时发生未预期异常", number)
+                summary["failed_issues"].append({"issue": number, "error": str(exc)})
+                summary["handled"].append(
+                    {"issue": number, "commented": False, "closed": False,
+                     "labels_updated": False, "skipped": False, "error": str(exc)}
+                )
+
+        if summary["failed_issues"]:
+            logger.warning("有 %d 个 Issue 处理失败：%s",
+                           len(summary["failed_issues"]),
+                           "、".join(f"#{item['issue']}" for item in summary["failed_issues"]))
 
         return summary
 
