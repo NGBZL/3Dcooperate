@@ -19,13 +19,15 @@
 
 ```
 kanban/
-├── server.py                 # Flask 后端（REST API + 页面渲染）
-├── github_client.py          # GitHub API 封装（重试、限流、负责人解析、分支/提交收集）
-├── database.py               # SQLite 操作（建表 / 增删改查 / 轻量迁移）
-├── config.py                 # 配置读取、人员名单、环境变量校验
+├── server.py                 # Flask 后端（REST API + 页面渲染 + 登录/权限）
+├── auth.py                   # 登录、Session、权限校验（也可当命令行用：list / reset）
+├── github_client.py          # GitHub API 封装（重试、限流、负责人解析、分支/提交、审核报告解析）
+├── database.py               # SQLite 操作（tasks / users / operation_logs，含轻量迁移）
+├── config.py                 # 配置读取、人员名单、会话密钥、环境变量校验
 ├── requirements.txt          # Python 依赖
 ├── .env.example              # 看板配置模板（复制成 .env）
 ├── assignees.local.json      # 负责人「代号 -> 真名」映射（本地专用，已 gitignore）
+├── secret.key                # 会话密钥（首次启动自动生成，已 gitignore）
 ├── tools/
 │   ├── check_names.py        # 推送前自检：真名有没有混进 Git
 │   └── test_review_parse.py  # 审核报告解析自检（离线，改动报告模板后必跑）
@@ -33,7 +35,8 @@ kanban/
 │   └── pre-commit            # 可选的提交前守卫（默认未启用，见下文）
 ├── .gitignore
 ├── templates/
-│   └── index.html            # 看板页面
+│   ├── index.html            # 看板页面
+│   └── login.html            # 登录页
 ├── static/
 │   ├── style.css             # 样式（参考 Trello）
 │   └── app.js                # 前端逻辑（原生 JS）
@@ -162,14 +165,86 @@ INFO   （页面顶部也会显示这个地址，并可一键复制）
 
 > 页面上的 ⓘ 按钮也会把防火墙命令直接显示在状态栏里，方便现场排查。
 
+## 多用户登录与权限
+
+6 个人各自在自己电脑上登录同一个看板，**只能操作自己的任务**，而且**不能手动把任务标成「完成」**。
+
+### 登录
+
+打开地址后先看到登录页，输入**姓名（真名）或代号**都可以：
+
+| 输入 | 例子（下表是占位示例，真实姓名在本地 assignees.local.json 里） |
+|------|----------|
+| 真名 | 张三 |
+| 代号 | 小明 |
+
+> 仓库里**不写真实姓名**：代号（小明…）出现在 GitHub 与数据库里，
+> 真名只存在本地 `assignees.local.json`，由界面翻译。推送前记得跑 `python tools/check_names.py`。
+
+初始密码统一是 `123456`，**登录后请立刻点右上角 🔑 改掉**（还在用初始密码时页面会持续提醒）。
+密码用 werkzeug 的 scrypt 哈希存储，数据库里没有明文；连续输错 5 次会锁定 60 秒。
+
+有人忘记密码时，在本机跑命令行工具重置（不需要停服务）：
+
+```bash
+python auth.py list            # 看有哪些人、谁还在用初始密码
+python auth.py reset 小美       # 重置为初始密码 123456
+python auth.py reset 小美 新密码  # 重置为指定密码
+```
+
+登录态存在 Flask session 里，默认保持 12 小时（`SESSION_LIFETIME_HOURS` 可调）；
+服务重启不会踢人下线，因为会话密钥持久化在本地 `secret.key`（已 gitignore，**不要提交**：
+泄露了别人就能伪造登录态）。
+
+### 权限规则
+
+| 操作 | 谁能做 |
+|------|--------|
+| 查看所有人的任务 | 所有登录用户 |
+| 改状态（Todo/Doing）| **只有负责人本人** |
+| 改负责人 | 未分配的任务谁都能指派；已分配的任务只有本人能改 |
+| 认领任务 | 任何人（把未分配的任务指派给自己） |
+| 删除（仅本地缓存） | 负责人本人，或未分配的任务 |
+| 同步 GitHub | 所有登录用户（只读 GitHub，不改远端） |
+| 修改密码 | 只能改自己的 |
+
+* 别人的任务在页面上**置灰、不可拖拽**，点它的负责人徽章/删除也会提示「只有本人能改」
+* 未分配的任务需要**先认领**（改成自己）才能推进状态；未认领就拖会提示你先指派给自己
+* 后端会独立校验一遍（返回 403），前端的置灰只是提前告诉你，不是安全边界
+
+### 禁止「假完成」
+
+**Done 列不接受任何手动拖入**：
+
+- 前端：拖到 Done 列会提示「❌ 不能手动完成：请提交代码等待 Agent 审核，审核通过后会自动移到 Done」，
+  列的标题上带 🔒、斜纹底色，`←` `→` 按钮也不会把你送进 Done
+- 后端：`PUT /api/tasks/<n>` 带 `status=done` 一律返回 **403**，GitHub 标签不会被改
+- 新建任务时也不能直接选 Done
+- 只有 **Agent 审核通过后写入 GitHub 标签**，同步回看板才显示在 Done 列
+  （`DONE_REQUIRES_AGENT=0` 可以关掉这条限制，一般不要关）
+
+已经完成的任务**可以退回 Doing**（负责人本人操作），用于审核误判时返工。
+
+### 操作日志
+
+所有写操作都会记进 `operation_logs` 表（`GET /api/logs`，支持 `?mine=1&limit=50`）：
+
+| 记录内容 | 示例 |
+|----------|------|
+| 谁做的 | 小美（代号；真名不会写进日志和数据库） |
+| 做了什么 | create_task / update_status / update_assignee / delete_task / sync / login / logout / change_password |
+| 改了什么 | old_value → new_value |
+| **被拒绝的尝试** | `result=denied` + 原因（例如「这是 小刚 的任务」），方便事后追责 |
+
 ## 使用流程
 
 ### 状态视图（默认）
 
-1. 启动服务，点击「🔄 同步」把 GitHub 上的 Issues 拉到看板
-2. 点击「➕ 新建任务」创建任务（会在 GitHub 上真实创建 Issue）
-3. 拖动卡片改变状态，或在手机上点卡片上的 `←` `→`
+1. 登录后点击「🔄 同步」把 GitHub 上的 Issues 拉到看板
+2. 点击「➕ 新建任务」创建任务（会在 GitHub 上真实创建 Issue，负责人默认是你自己）
+3. 拖动**自己的**卡片改变状态，或在手机上点卡片上的 `←` `→`
 4. 每次状态变化都会同步修改 GitHub Issue 的 `todo` / `doing` / `done` 标签
+5. 「完成」不由你决定：提交代码 → Agent 审核通过 → 自动进入 Done
 
 ### 人员视图
 
@@ -287,52 +362,96 @@ git config --unset core.hooksPath       # 关闭
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/tasks` | 获取本地全部任务（支持 `?status=todo`、`?assignee=小明`、`?assignee=未分配`、`?q=关键字`） |
-| POST | `/api/tasks` | 新建任务，同时在 GitHub 创建 Issue（可带 `assignee`） |
-| PUT | `/api/tasks/<issue_number>` | 更新状态和/或负责人（字段可选传，只传哪个就改哪个） |
-| PUT | `/api/tasks/<issue_number>/assignee` | **仅更新负责人**（人员视图拖拽 / 徽章选择器调用） |
-| DELETE | `/api/tasks/<issue_number>` | 从本地缓存删除（不影响 GitHub） |
+| GET | `/login` | 登录页（唯一的匿名页面） |
+| POST | `/login` | 提交登录（`username` 可以是代号或真名） |
+| GET | `/logout` | 登出 |
+| GET | `/api/me` | 当前登录用户（前端据此显示与控权） |
+| POST | `/api/change-password` | 修改自己的密码 |
+| GET | `/api/logs` | 操作日志（`?limit=50&mine=1`） |
+| GET | `/api/tasks` | 获取全部任务（支持 `?status=todo`、`?assignee=小明`、`?mine=1`、`?q=关键字`） |
+| POST | `/api/tasks` | 新建任务，同时在 GitHub 创建 Issue（负责人默认是自己；**不能建到 done**） |
+| PUT | `/api/tasks/<issue_number>` | 更新状态和/或负责人（**只有负责人本人**；**不能改成 done**） |
+| PUT | `/api/tasks/<issue_number>/assignee` | 仅更新负责人（未分配的任务谁都能指派） |
+| DELETE | `/api/tasks/<issue_number>` | 从本地缓存删除（本人或未分配；不影响 GitHub） |
 | POST | `/api/sync` | 从 GitHub 同步（`?with_meta=0` 跳过分支/提交、`?with_reviews=0` 跳过审核报告，可加速） |
 | GET | `/api/assignees` | 负责人名单与各自任务数 |
 | GET | `/api/health` | 健康检查（`?deep=1` 会真实请求 GitHub 校验 Token） |
-| GET | `/api/server-info` | 本机局域网访问地址（ip / port / url / urls / hostname / 防火墙提示） |
+| GET | `/api/server-info` | 本机局域网访问地址（**无需登录**，登录页也要显示它） |
+
+**所有 `/api/*` 都需要登录**（未登录返回 401，前端会自动跳登录页），只有 `/api/server-info` 与登录页例外。
 
 ```bash
-# 新建任务（带负责人）
-curl -X POST http://localhost:5000/api/tasks \
-  -H "Content-Type: application/json" \
-  -d '{"title":"完成点云配准模块","description":"ICP + 粗配准","status":"todo","assignee":"小明"}'
+# 先登录拿到 Cookie，再调用其它接口（给某人设好密码后，他也可以用真名登录）
+curl -c cookie.txt -X POST http://localhost:5000/login \
+  -d "username=小明&password=123456"
 
-# 改负责人 / 取消分配
-curl -X PUT http://localhost:5000/api/tasks/12/assignee -H "Content-Type: application/json" -d '{"assignee":"小红"}'
-curl -X PUT http://localhost:5000/api/tasks/12/assignee -H "Content-Type: application/json" -d '{"assignee":"未分配"}'
+# 新建任务（负责人默认是自己）
+curl -b cookie.txt -X POST http://localhost:5000/api/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"title":"完成点云配准模块","description":"ICP + 粗配准","status":"todo"}'
+
+# 改状态（只能改自己的；改成 done 会被 403 拒绝）
+curl -b cookie.txt -X PUT http://localhost:5000/api/tasks/12 \
+  -H "Content-Type: application/json" -d '{"status":"doing"}'
+
+# 认领未分配的任务 / 改负责人
+curl -b cookie.txt -X PUT http://localhost:5000/api/tasks/12/assignee \
+  -H "Content-Type: application/json" -d '{"assignee":"小美"}'
+
+# 看自己的操作日志
+curl -b cookie.txt "http://localhost:5000/api/logs?mine=1&limit=20"
 ```
 
 ## 数据库表结构
 
 ```sql
 CREATE TABLE tasks (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    issue_number   INTEGER UNIQUE,   -- GitHub Issue 编号
-    title          TEXT NOT NULL,
-    description    TEXT,             -- Issue 正文（不含“负责人”行）
-    status         TEXT DEFAULT 'todo',   -- todo / doing / done
-    assignee       TEXT DEFAULT '',       -- 负责人代号；空串 = 未分配
-    branch         TEXT,             -- 关联分支名
-    commits        TEXT DEFAULT '[]',     -- 关联提交（JSON 字符串）
-    html_url       TEXT DEFAULT '',       -- Issue 网页地址
-    state          TEXT DEFAULT 'open',   -- open / closed
-    review_score   INTEGER DEFAULT NULL,  -- Agent 审核评分 0~100
-    review_passed  INTEGER DEFAULT NULL,  -- 1=通过 / 0=不通过 / NULL=无结论
-    review_comment TEXT DEFAULT '',       -- Agent 评语（含改进建议）
-    updated_at     TEXT
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_number      INTEGER UNIQUE,   -- GitHub Issue 编号
+    title             TEXT NOT NULL,
+    description       TEXT,             -- Issue 正文（不含“负责人”行）
+    status            TEXT DEFAULT 'todo',   -- todo / doing / done
+    assignee          TEXT DEFAULT '',       -- 负责人代号；空串 = 未分配
+    assignee_username TEXT DEFAULT '',       -- 负责人登录名（当前等于 assignee，自动同步）
+    branch            TEXT,             -- 关联分支名
+    commits           TEXT DEFAULT '[]',     -- 关联提交（JSON 字符串）
+    html_url          TEXT DEFAULT '',       -- Issue 网页地址
+    state             TEXT DEFAULT 'open',   -- open / closed
+    review_score      INTEGER DEFAULT NULL,  -- Agent 审核评分 0~100
+    review_passed     INTEGER DEFAULT NULL,  -- 1=通过 / 0=不通过 / NULL=无结论
+    review_comment    TEXT DEFAULT '',       -- Agent 评语（含改进建议）
+    updated_at        TEXT
+);
+
+-- 登录用户：username 是**代号**，真名只存在本地 assignees.local.json 里
+CREATE TABLE users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT UNIQUE NOT NULL,  -- 小明 / 小红 / …
+    display_name  TEXT DEFAULT '',       -- 预留；当前由真名映射表解析
+    password_hash TEXT NOT NULL,         -- werkzeug scrypt 哈希，无明文
+    created_at    TEXT,
+    last_login_at TEXT
+);
+
+-- 操作日志：谁、对哪个 Issue、做了什么、结果如何（含被拒绝的尝试）
+CREATE TABLE operation_logs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    username     TEXT,
+    issue_number INTEGER,
+    action       TEXT NOT NULL,
+    old_value    TEXT DEFAULT '',
+    new_value    TEXT DEFAULT '',
+    result       TEXT DEFAULT 'ok',      -- ok / denied / error
+    detail       TEXT DEFAULT '',
+    timestamp    TEXT
 );
 ```
 
-> **旧库无需删库重建**：启动时会读取 `PRAGMA table_info`，把缺失的列（`assignee`、`commits`、
-> `html_url`、`state`、`review_score`、`review_passed`、`review_comment`）逐个
-> `ALTER TABLE ADD COLUMN` 补齐；并用 `try/except` 兜住 “duplicate column name” 的情况，
-> 重复启动、并发启动都不会报错。
+> **旧库无需删库重建**：启动时会读取 `PRAGMA table_info`，把缺失的列（`assignee`、
+> `assignee_username`、`commits`、`html_url`、`state`、`review_score`、`review_passed`、
+> `review_comment`）逐个 `ALTER TABLE ADD COLUMN` 补齐，并自动创建 `users` /
+> `operation_logs` 两张表、把老任务的 `assignee_username` 补成 `assignee`；
+> 并用 `try/except` 兜住 “duplicate column name” 的情况，重复启动、并发启动都不会报错。
 
 ---
 
