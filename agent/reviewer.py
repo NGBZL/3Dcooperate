@@ -138,6 +138,7 @@ class CodeReviewer:
         json_body: Optional[dict[str, Any]] = None,
         allow: tuple[int, ...] = (200, 201, 204),
         retries: Optional[int] = None,
+        accept: Optional[str] = None,
     ) -> requests.Response:
         """
         调用 GitHub API（带重试与明确的中文错误提示）。
@@ -148,6 +149,7 @@ class CodeReviewer:
         :param json_body: JSON 请求体
         :param allow: 视为成功的状态码
         :param retries: 最大尝试次数，默认读配置
+        :param accept: 覆盖 Accept 头（例如取原始 diff 时用 application/vnd.github.diff）
         :return: requests.Response
         :raises ReviewError: 鉴权失败、权限不足、网络多次失败等
         """
@@ -155,12 +157,16 @@ class CodeReviewer:
         attempts = max(1, retries or cfg.GITHUB_MAX_RETRIES)
         last_error: Optional[Exception] = None
 
+        headers = self._headers()
+        if accept:
+            headers["Accept"] = accept
+
         for attempt in range(1, attempts + 1):
             try:
                 response = requests.request(
                     method,
                     url,
-                    headers=self._headers(),
+                    headers=headers,
                     params=params,
                     json=json_body,
                     timeout=cfg.GITHUB_TIMEOUT,
@@ -275,6 +281,7 @@ class CodeReviewer:
         blocks: list[str] = []
         used = 0
         skipped: list[str] = []
+        missing_patch: list[str] = []
         additions = deletions = 0
         truncated = False
 
@@ -288,10 +295,15 @@ class CodeReviewer:
                 skipped.append(filename)
                 continue
 
-            patch = item.get("patch") or ""
+            patch = item.get("patch")
             if not patch:
-                # 二进制文件、或 GitHub 因体积过大未返回 patch
-                skipped.append(f"{filename}（二进制或无 diff）")
+                # 注意：这里**不能**直接当成二进制文件跳过。
+                # GitHub 对较大的 diff 会省略 files[].patch 字段（文件本身完全正常），
+                # 真正的二进制文件也只是没有 patch。把两者混为一谈会导致
+                # “明明改了代码却报没有可审核变更”。
+                if patch is None:
+                    missing_patch.append(filename)
+                skipped.append(f"{filename}（未返回 patch）")
                 continue
 
             if len(patch) > cfg.DIFF_MAX_CHARS_PER_FILE:
@@ -319,10 +331,94 @@ class CodeReviewer:
             "additions": additions,
             "deletions": deletions,
             "skipped": skipped,
+            "missing_patch": missing_patch,
             "truncated": truncated,
             "chars": used,
         }
         return "\n\n".join(blocks), stats
+
+    def _fetch_raw_diff(self, before_sha: str, after_sha: str) -> str:
+        """
+        直接以 ``application/vnd.github.diff`` 媒体类型取原始 unified diff。
+
+        用途：GitHub 在 diff 较大时会省略 ``files[].patch`` 字段，此时只能靠这个接口
+        拿到真正的改动内容。找不到时返回空串（不抛异常）。
+
+        :param before_sha: push 前的 SHA（空或全 0 表示单提交）
+        :param after_sha: push 后的 SHA
+        :return: 原始 diff 文本
+        """
+        if not before_sha or self._is_zero_sha(before_sha) or before_sha == after_sha:
+            path = f"/repos/{self.repo}/commits/{after_sha}"
+        else:
+            path = f"/repos/{self.repo}/compare/{before_sha}...{after_sha}"
+
+        try:
+            response = self._request("GET", path, accept="application/vnd.github.diff")
+        except ReviewError as exc:
+            logger.warning("获取原始 diff 失败：%s", exc.message)
+            return ""
+
+        text = getattr(response, "text", "") or ""
+        if not text.strip():
+            return ""
+
+        # 原始 diff 可能很大，这里按总量上限截断后再交给模型
+        if len(text) > cfg.DIFF_MAX_CHARS:
+            head = text[: cfg.DIFF_MAX_CHARS]
+            # 尽量切在完整的一行上，避免把一行 diff 劈成两半
+            cut = head.rfind("\n")
+            if cut > cfg.DIFF_MAX_CHARS // 2:
+                head = head[:cut]
+            text = head + "\n... [已截断：原始 diff 过长，只展示了前面一部分]"
+
+        logger.info("已改用原始 diff 接口取得 %d 字符的可审核内容", len(text))
+        return text
+
+    def _collect_diff(
+        self, files: list[dict[str, Any]], before_sha: str, after_sha: str
+    ) -> tuple[str, dict[str, Any]]:
+        """
+        取「可审核的 diff 文本」，带 patch 缺失时的兜底。
+
+        流程：
+        1. 先用 files[].patch 拼 diff（常规路径）
+        2. 如果拼出来是空的、但确实有文件改动（说明 GitHub 省略了 patch 字段），
+           改用 ``application/vnd.github.diff`` 再取一次
+
+        :param files: _fetch_changed_files() 的返回值
+        :param before_sha: push 前的 SHA
+        :param after_sha: push 后的 SHA
+        :return: (diff 文本, 统计信息)
+        """
+        diff_text, stats = self._format_diff(files)
+
+        if diff_text.strip() or not files:
+            return diff_text, stats
+
+        # 全都没 patch 时，先确认“有没有本该被审核的文件”：
+        # 如果改的全是二进制/锁文件（本就在忽略名单里），那跳过是正确的，不必再发请求。
+        candidates = [f.get("filename", "") for f in files
+                      if not self._is_ignored(f.get("filename", ""))]
+        if not candidates:
+            logger.info("改动全部位于被忽略的文件中（二进制/锁文件），跳过审核")
+            return diff_text, stats
+
+        # 有正常文件却拿不到 patch → 几乎可以确定是 GitHub 因体积省略了 patch
+        logger.warning("files[].patch 全部缺失（共 %d 个文件，其中 %d 个本该审核：%s），改用原始 diff 接口重试",
+                       len(files), len(candidates), ", ".join(candidates[:5]))
+        raw = self._fetch_raw_diff(before_sha, after_sha)
+        if raw.strip():
+            stats = dict(stats)
+            stats.update({
+                "raw_diff": True,
+                "chars": len(raw),
+                "reviewed_files": len(candidates),
+            })
+            notes = "# 以下为原始 unified diff（GitHub 未返回逐文件 patch）\n\n"
+            return notes + raw, stats
+
+        return diff_text, stats
 
     def get_commit_diff(self, before_sha: str, after_sha: str) -> str:
         """
@@ -333,7 +429,7 @@ class CodeReviewer:
         :return: 拼接好的 diff 文本（可能被截断）
         """
         files, _ = self._fetch_changed_files(before_sha, after_sha)
-        diff_text, stats = self._format_diff(files)
+        diff_text, stats = self._collect_diff(files, before_sha, after_sha)
         logger.info("diff 统计：%s", {k: v for k, v in stats.items() if k != "skipped"})
         return diff_text
 
@@ -666,12 +762,17 @@ class CodeReviewer:
 
         # ---- 1. 取变更文件与 diff ----
         files, meta = self._fetch_changed_files(before_sha, after_sha)
-        diff_text, stats = self._format_diff(files)
+        # _collect_diff 内部会在 GitHub 省略 patch 字段时自动改用原始 diff 接口兜底
+        diff_text, stats = self._collect_diff(files, before_sha, after_sha)
         summary["stats"] = stats
         summary["mode"] = meta.get("mode")
 
         if not diff_text.strip():
-            reason = "本次提交没有可审核的代码变更（全是二进制/锁文件/被忽略文件）"
+            if files:
+                reason = (f"本次改动共 {len(files)} 个文件，但都取不到可审核的 diff"
+                          f"（二进制文件，或原始 diff 也为空）")
+            else:
+                reason = "本次提交没有文件变更"
             logger.warning(reason)
             summary.update({"skipped": True, "reason": reason})
             return summary

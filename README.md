@@ -453,7 +453,8 @@ git rev-parse HEAD~1          # 上一个提交
 | 模型的 `passed` 与 `score` 矛盾 | 以 `score >= 70` 为准，并打印告警 |
 | LLM Key 无效 / 网络失败 / 限流 | 评论一条「审核未能完成」，**不改 Issue 状态**，Action 显示为失败（红叉）便于发现 |
 | 同一个提交重复审核（Action 重跑） | 通过评论里的隐藏标记去重，**在调用 LLM 之前就短路**，不重复花 token；想强制重审加 `--force` |
-| 只改了图片 / 点云文件 / 锁文件 | 视为无有效 diff，跳过审核 |
+| 只改了图片 / 点云文件 / 锁文件 | 视为无有效 diff，跳过审核（也不会多花一次请求去取原始 diff） |
+| **GitHub 省略了 `files[].patch`** | 自动改用 `application/vnd.github.diff` 接口取原始 diff 再送审，**不会**误判成“没有可审核的代码”而跳过。diff 很大、或文件混入了异常换行符/编码时最容易触发这条路径 |
 | diff 特别大 | 超出 `AGENT_DIFF_MAX_CHARS`（默认 12000 字符）后截断，并在提示词里告知模型「已截断」 |
 | force-push 导致无法 compare | 自动退化为只审核最后一个提交 |
 | 分支首次 push（before 全 0） | 自动改为单提交审核 |
@@ -592,5 +593,3 @@ A：可以。窄屏下列会竖向堆叠，拖拽在触屏上不可用，请用�
 - 存储：SQLite（本地缓存，支持旧库自动迁移）
 - Agent：Python + requests（不引入 PyGithub），兼容 DeepSeek / OpenAI 协议
 - 数据源：GitHub REST API v3 + GitHub Actions
-#   A g e n t   t e s t   1 0 / 1 0 / 2 0 2 6   1 3 : 3 2 : 0 9  
- 

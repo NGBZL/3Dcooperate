@@ -21,6 +21,7 @@ Agent 自检脚本（无需网络、无需真实 API Key）
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -83,6 +84,8 @@ class FakeGitHub:
     :param reviewed_issues: 只给这些 Issue 返回“已有本次提交报告”的评论，
                             用于测试“部分已审 / 全部已审”的分支
     :param marker_sha: 评论里标记的 commit sha
+    :param raw_diff: 以 vnd.github.diff 媒体类型请求时返回的原始 diff
+                     （用于模拟“GitHub 省略了 files[].patch”的场景）
     """
 
     def __init__(
@@ -93,6 +96,7 @@ class FakeGitHub:
         issue_state: str = "open",
         reviewed_issues: Optional[set[int]] = None,
         marker_sha: str = "b" * 40,
+        raw_diff: str = "",
     ) -> None:
         self.files = files
         self.message = message
@@ -100,6 +104,7 @@ class FakeGitHub:
         self.issue_state = issue_state
         self.reviewed_issues = reviewed_issues
         self.marker_sha = marker_sha
+        self.raw_diff = raw_diff
         self.calls: list[dict[str, Any]] = []
 
     # -- 与真实 _request 保持同样的契约：非 allow 的状态码抛 ReviewError --
@@ -112,12 +117,20 @@ class FakeGitHub:
         json_body: Optional[dict[str, Any]] = None,
         allow: tuple[int, ...] = (200, 201, 204),
         retries: Optional[int] = None,
+        accept: Optional[str] = None,
     ) -> FakeResponse:
-        self.calls.append({"method": method, "path": path, "json": json_body})
+        self.calls.append({"method": method, "path": path, "json": json_body, "accept": accept})
+        # 请求原始 diff（application/vnd.github.diff）时直接返回预制文本
+        if accept and "diff" in accept:
+            return FakeResponse(200, None, text=self.raw_diff)
         status, payload = self._route(method, path, json_body)
         if status not in allow:
             raise ReviewError(f"假装 GitHub 返回 {status}：{path}", status)
         return FakeResponse(status, payload)
+
+    def diff_requests(self) -> list[dict[str, Any]]:
+        """找出所有「请求原始 diff」的调用。"""
+        return [c for c in self.calls if c.get("accept") and "diff" in c["accept"]]
 
     def _route(
         self, method: str, path: str, json_body: Optional[dict[str, Any]] = None
@@ -440,7 +453,7 @@ def test_review_paths() -> None:
     ], "feat: x\n\n#1")
     reviewer = make_reviewer(fake, FakeLLM())
     result = reviewer.review("a" * 40, "b" * 40)
-    check("无有效 diff 跳过", result["skipped"] is True and "没有可审核" in result["reason"], result)
+    check("无有效 diff 跳过", result["skipped"] is True and "取不到可审核的 diff" in result["reason"], result)
 
     # 6.3 已审核过（评论里已有同一 sha 的标记）→ 短路，连 LLM 都不调用
     fake = FakeGitHub(
@@ -566,14 +579,79 @@ def test_token_cost() -> None:
     check("--dry-run 仍会调用 LLM（预期行为）", len(llm.calls) == 1, len(llm.calls))
 
 
+def test_missing_patch_fallback() -> None:
+    """
+    GitHub 省略 files[].patch 时的兜底。
+
+    真实事故：用户 push 只改了 README.md（+596/-594），compare 接口返回了文件但
+    **没有 patch 字段**（diff 较大时 GitHub 会省略），旧代码把“没有 patch”当成
+    “二进制文件”直接跳过，于是 Actions 显示“没有可审核的代码变更”。
+    """
+    print("[8] patch 缺失时的兜底（真实事故回归）")
+
+    raw = ("diff --git a/README.md b/README.md\n"
+           "--- a/README.md\n"
+           "+++ b/README.md\n"
+           "@@ -1,2 +1,3 @@\n"
+           " # 项目看板\n"
+           "+新增的一行说明\n")
+
+    # 9.1 有正常文件但没 patch，且原始 diff 能取到 → 必须照常审核
+    files = [{"filename": "README.md", "status": "modified",
+              "additions": 596, "deletions": 594, "patch": None}]
+    fake = FakeGitHub(files, "test: 测试Agent审核流程 #1", reviewed_issues=set(), raw_diff=raw)
+    llm = FakeLLM(passed=True, score=80)
+    reviewer = make_reviewer(fake, llm)
+    result = reviewer.review("1d3bcd2", "af24305")
+
+    check("patch 缺失时不再误判为跳过", result.get("skipped") is False, result)
+    check("patch 缺失时确实调用了 LLM（1 次）", len(llm.calls) == 1, len(llm.calls))
+    check("提示词里带上了原始 diff", "新增的一行说明" in llm.calls[0][1], llm.calls[0][1][:160])
+    check("统计里标记 raw_diff", result["stats"].get("raw_diff") is True, result["stats"])
+    check("确实发起了 diff 媒体类型请求", len(fake.diff_requests()) == 1, fake.diff_requests())
+    check("跳过文件列表里注明“未返回 patch”",
+          any("未返回 patch" in item for item in result["stats"]["skipped"]), result["stats"]["skipped"])
+
+    # 9.2 原始 diff 也拿不到 → 才跳过，且原因要说清楚
+    fake = FakeGitHub(files, "test: x #1", raw_diff="")
+    llm = FakeLLM()
+    reviewer = make_reviewer(fake, llm)
+    result = reviewer.review("1d3bcd2", "af24305")
+    check("都取不到 diff 时才跳过", result.get("skipped") is True, result)
+    check("都取不到时不调用 LLM", llm.calls == [], len(llm.calls))
+    check("跳过原因写明取不到 diff", "取不到可审核的 diff" in result["reason"], result["reason"])
+
+    # 9.3 全是二进制/锁文件 → 跳过，且不该多发那一次 diff 请求
+    binfiles = [{"filename": "data/scan.pcd", "status": "added",
+                 "additions": 0, "deletions": 0, "patch": None},
+                {"filename": "package-lock.json", "status": "modified",
+                 "additions": 9, "deletions": 9, "patch": None}]
+    fake = FakeGitHub(binfiles, "feat: x #1", raw_diff=raw)
+    llm = FakeLLM()
+    reviewer = make_reviewer(fake, llm)
+    result = reviewer.review("a" * 40, "b" * 40)
+    check("纯二进制/锁文件仍然跳过", result.get("skipped") is True, result)
+    check("纯二进制时不额外请求原始 diff", fake.diff_requests() == [], fake.diff_requests())
+
+    # 9.4 常规路径：有 patch 时不应触发兜底（省一次请求）
+    normal = [{"filename": "recon/a.py", "status": "modified", "additions": 1,
+               "deletions": 0, "patch": "@@ -1 +1,2 @@\n import os\n+import sys\n"}]
+    fake = FakeGitHub(normal, "feat: x #1", reviewed_issues=set(), raw_diff=raw)
+    llm = FakeLLM()
+    reviewer = make_reviewer(fake, llm)
+    result = reviewer.review("a" * 40, "b" * 40)
+    check("有 patch 时不触发兜底请求", fake.diff_requests() == [], fake.diff_requests())
+    check("有 patch 时正常审核", result.get("skipped") is False and len(llm.calls) == 1, result)
+
+
 # ============================================================
-# 8. 入口脚本
+# 9. 入口脚本
 # ============================================================
 
 
 def test_run_entry() -> None:
     """测试 run.main 的退出码与摘要生成。"""
-    print("[8] 入口脚本 run.main")
+    print("[9] 入口脚本 run.main")
 
     summary_file = Path(__file__).resolve().parent / "_selftest_summary.md"
     if summary_file.exists():
@@ -599,9 +677,14 @@ def test_run_entry() -> None:
             }
 
     original_reviewer = agent_run.CodeReviewer
-    original_summary_env = __import__("os").environ.get("GITHUB_STEP_SUMMARY")
+    original_summary_env = os.environ.get("GITHUB_STEP_SUMMARY")
+
+    # 关键：**整个测试期间**都把 GITHUB_STEP_SUMMARY 指向临时文件。
+    # 否则在 GitHub Actions 里（该变量是真实路径），下面“缺少 SHA”那次调用会把
+    # 「❌ Agent 审核失败 / 缺少本次提交 SHA」写进真实 Job Summary，
+    # 让人误以为是 workflow 没传 COMMIT_SHA —— 这个坑真实发生过，别再踩。
+    os.environ["GITHUB_STEP_SUMMARY"] = str(summary_file)
     agent_run.CodeReviewer = StubReviewer  # type: ignore[assignment]
-    __import__("os").environ["GITHUB_STEP_SUMMARY"] = str(summary_file)
     try:
         code = agent_run.main(["--after", "b" * 40, "--before", "a" * 40, "--repo", "demo/repo"])
         check("成功时退出码 0", code == 0, code)
@@ -610,18 +693,22 @@ def test_run_entry() -> None:
             summary = summary_file.read_text(encoding="utf-8")
             check("摘要含结论", "✅ 通过" in summary and "88" in summary, summary[:200])
             check("摘要含 Issue 处理表", "| #1 |" in summary, summary)
+
+        # 缺少 after_sha → 退出码 2；这条提示也必须落进临时摘要，而不是真实摘要
+        summary_file.unlink(missing_ok=True)
+        code = agent_run.main(["--after", "", "--before", "a" * 40])
+        check("缺少 commit SHA 返回 2", code == 2, code)
+        leaked = summary_file.read_text(encoding="utf-8") if summary_file.exists() else ""
+        check("缺 SHA 的提示只写进临时摘要（不污染真实 Job Summary）",
+              "缺少本次提交 SHA" in leaked, leaked[:120] or "临时摘要为空")
     finally:
         agent_run.CodeReviewer = original_reviewer  # type: ignore[assignment]
         if original_summary_env is None:
-            __import__("os").environ.pop("GITHUB_STEP_SUMMARY", None)
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
         else:
-            __import__("os").environ["GITHUB_STEP_SUMMARY"] = original_summary_env
+            os.environ["GITHUB_STEP_SUMMARY"] = original_summary_env
         if summary_file.exists():
             summary_file.unlink()
-
-    # 缺少 after_sha → 退出码 2
-    code = agent_run.main(["--after", "", "--before", "a" * 40])
-    check("缺少 commit SHA 返回 2", code == 2, code)
 
 
 # ============================================================
@@ -640,6 +727,7 @@ def main() -> int:
     test_review_llm_error()
     test_review_paths()
     test_token_cost()
+    test_missing_patch_fallback()
     test_run_entry()
 
     print()
