@@ -22,22 +22,24 @@ Agent 自检脚本（无需网络、无需真实 API Key）
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Optional
 
 # 兼容 python -m agent.selftest 与 python agent/selftest.py
+# 注意：这里**故意不导入 agent.run**。
+# 一旦 run.py 被写坏（例如混入 NUL 字节），模块级 import 会让本自检直接
+# 抛 SyntaxError 而无法给出任何有用提示，所以改成用的时候再延迟导入。
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from agent import config as cfg
     from agent.llm_client import LLMClient, LLMError
     from agent.reviewer import CodeReviewer, ReviewError
-    from agent import run as agent_run
 else:
     from . import config as cfg
     from .llm_client import LLMClient, LLMError
     from .reviewer import CodeReviewer, ReviewError
-    from . import run as agent_run
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -45,6 +47,100 @@ except Exception:  # pragma: no cover
     pass
 
 FAILURES: list[str] = []
+
+# 需要做编码体检的文件类型
+SOURCE_SUFFIXES = {
+    ".py", ".md", ".js", ".css", ".html", ".yml", ".yaml", ".txt",
+    ".json", ".toml", ".cfg", ".ini", ".example",
+}
+SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".idea", ".vscode"}
+
+NUL = bytes([0])
+UTF16_BOMS = (bytes([0xFF, 0xFE]), bytes([0xFE, 0xFF]))
+UTF8_BOM = bytes([0xEF, 0xBB, 0xBF])
+
+
+def _load_run_module():
+    """
+    延迟导入 agent.run。
+
+    :return: agent.run 模块
+    """
+    if __package__ in (None, ""):
+        from agent import run as agent_run
+    else:
+        from . import run as agent_run
+    return agent_run
+
+
+def _tracked_files(root: Path) -> Optional[list[Path]]:
+    """
+    用 git 列出仓库里被跟踪的文件。
+
+    :param root: 仓库根目录
+    :return: 文件路径列表；不在 git 仓库中（或 git 不可用）时返回 None
+    """
+    try:
+        result = subprocess.run(
+            ["git", "ls-files"], cwd=str(root), capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    return [root / line for line in result.stdout.splitlines() if line.strip()]
+
+
+def scan_source_encoding(root: Path) -> list[str]:
+    """
+    体检仓库里源码/文档的编码，重点抓 NUL 字节。
+
+    为什么要有这一步：Windows PowerShell 5.1 里 `>>`、`>`、`Add-Content` 默认按
+    **UTF-16LE** 写入，用它们追加/重定向就会在普通文本文件里留下 NUL 字节。
+    Python 遇到这种文件会直接报
+    ``SyntaxError: source code string cannot contain null bytes``，
+    而且报错位置常常是 **import 它的那个文件**（例如 selftest.py），很容易误判。
+
+    检查范围优先用 ``git ls-files``（即 CI 里会看到的那批文件），
+    避免把本地的临时输出文件也算进来；不在 git 仓库时退化为目录遍历。
+
+    :param root: 仓库根目录
+    :return: 问题描述列表（空列表表示全部正常）
+    """
+    problems: list[str] = []
+
+    tracked = _tracked_files(root)
+    if tracked is not None:
+        candidates = tracked
+    else:
+        candidates = [p for p in sorted(root.rglob("*"))
+                      if p.is_file() and not any(part in SKIP_DIRS for part in p.parts)]
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        if any(part in SKIP_DIRS for part in path.parts):
+            continue
+        if path.suffix.lower() not in SOURCE_SUFFIXES and path.name != ".gitignore":
+            continue
+
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+
+        rel = path.relative_to(root)
+        if NUL in raw:
+            problems.append(f"{rel}: 含 {raw.count(NUL)} 个 NUL 字节（文件被写成 UTF-16 了？）")
+        elif raw[:2] in UTF16_BOMS:
+            problems.append(f"{rel}: 是 UTF-16 编码（带 BOM），应改为 UTF-8")
+        elif raw[:3] == UTF8_BOM:
+            problems.append(f"{rel}: 含 UTF-8 BOM，建议去掉")
+
+    return problems
 
 
 def check(name: str, condition: bool, extra: Any = "") -> None:
@@ -653,6 +749,9 @@ def test_run_entry() -> None:
     """测试 run.main 的退出码与摘要生成。"""
     print("[9] 入口脚本 run.main")
 
+    # 延迟导入：即使 agent/run.py 被写坏，前面的编码体检也能先给出清晰提示
+    agent_run = _load_run_module()
+
     summary_file = Path(__file__).resolve().parent / "_selftest_summary.md"
     if summary_file.exists():
         summary_file.unlink()
@@ -719,6 +818,25 @@ def main() -> int:
     print("=" * 60)
     print("Agent 自检开始（全部离线，不需要 API Key）")
     print("=" * 60)
+
+    # ---- [0] 编码体检放最前面 ----
+    # 文件一旦混入 NUL 字节，后面任何 import 都会以难以定位的 SyntaxError 失败，
+    # 所以先单独拦一次，把话说清楚。
+    repo_root = Path(__file__).resolve().parent.parent
+    encoding_problems = scan_source_encoding(repo_root)
+    if encoding_problems:
+        print("[0] 源码编码体检 —— 发现问题：")
+        for item in encoding_problems:
+            print("   ✗", item)
+        print()
+        print("最常见原因：在 Windows PowerShell 里用 `>>` 或 Add-Content 追加内容，")
+        print("默认写成 UTF-16LE，会在文件里留下 NUL 字节。请改用编辑器修改，或：")
+        print('   Add-Content -Encoding utf8 <文件> "要追加的内容"')
+        print()
+        print("修复后重新运行：python -m agent.selftest")
+        return 1
+    print("[0] 源码编码体检通过（无 NUL 字节 / 无 BOM）")
+    print()
 
     test_linked_issues()
     test_json_parsing()
