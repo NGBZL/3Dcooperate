@@ -21,6 +21,7 @@ Agent 自检脚本（无需网络、无需真实 API Key）
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
@@ -795,7 +796,15 @@ def test_run_entry() -> None:
 
         # 缺少 after_sha → 退出码 2；这条提示也必须落进临时摘要，而不是真实摘要
         summary_file.unlink(missing_ok=True)
-        code = agent_run.main(["--after", "", "--before", "a" * 40])
+        # 这一次调用是**故意**用空 SHA 触发报错的，把日志压掉，
+        # 免得 CI 日志里出现 “缺少本次提交 SHA” 让人误以为是 workflow 没配好
+        run_logger = logging.getLogger("agent.run")
+        previous_level = run_logger.level
+        run_logger.setLevel(logging.CRITICAL)
+        try:
+            code = agent_run.main(["--after", "", "--before", "a" * 40])
+        finally:
+            run_logger.setLevel(previous_level)
         check("缺少 commit SHA 返回 2", code == 2, code)
         leaked = summary_file.read_text(encoding="utf-8") if summary_file.exists() else ""
         check("缺 SHA 的提示只写进临时摘要（不污染真实 Job Summary）",
