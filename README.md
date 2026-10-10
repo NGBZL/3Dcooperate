@@ -592,3 +592,5 @@ A：可以。窄屏下列会竖向堆叠，拖拽在触屏上不可用，请用�
 - 存储：SQLite（本地缓存，支持旧库自动迁移）
 - Agent：Python + requests（不引入 PyGithub），兼容 DeepSeek / OpenAI 协议
 - 数据源：GitHub REST API v3 + GitHub Actions
+#   A g e n t   t e s t   1 0 / 1 0 / 2 0 2 6   1 3 : 3 2 : 0 9  
+ 
