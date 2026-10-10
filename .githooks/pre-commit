@@ -1,0 +1,33 @@
+#!/bin/sh
+# ============================================================
+# 提交前守卫（pre-commit hook，**可选启用**）
+# ------------------------------------------------------------
+# 目的：真实姓名只允许留在本地 assignees.local.json 里，
+#       绝不允许进入 Git 历史（一旦推上去就要重写历史了）。
+#
+# 检查逻辑全部在 tools/check_names.py 里（纯 Python，便于维护与测试），
+# 本文件只负责把它接到 git 的钩子上。
+#
+# 启用方式（在仓库根目录执行一次）：
+#   git config core.hooksPath .githooks
+#
+# 关闭方式：
+#   git config --unset core.hooksPath
+#
+# ⚠️ 前提：需要 Git 自带的 sh 能正常运行。若你的 Windows 上 git 提交时报
+#    “couldn't create signal pipe” 之类错误，说明 sh 不可用，请执行上面的关闭命令，
+#    改用 python tools/check_names.py 手动检查。
+#    临时跳过一次提交：git commit --no-verify
+# ============================================================
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+for candidate in python3 python py; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        # --hook：告诉检查器“由 git 钩子调用”，此时只需检查暂存内容与提交信息
+        exec "$candidate" "$ROOT/tools/check_names.py" --hook "$@"
+    fi
+done
+
+echo "pre-commit: 未找到 python，跳过真名检查" >&2
+exit 0

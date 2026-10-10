@@ -1,0 +1,80 @@
+name: Agent Code Review
+
+# ============================================================
+# 触发条件
+#   1. 有代码 push 到 main / master 分支（自动审核）
+#   2. 手动触发（workflow_dispatch），可指定要审核的 commit 区间
+# ============================================================
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      before_sha:
+        description: "起始提交 SHA（留空则只审核 after_sha 这一个提交）"
+        required: false
+        default: ""
+      after_sha:
+        description: "结束提交 SHA（留空则审核当前分支最新提交）"
+        required: false
+        default: ""
+
+# 同一分支的审核串行执行，避免两次 push 同时改 Issue 造成混乱；
+# 不取消进行中的任务，防止审核做了一半就被打断。
+concurrency:
+  group: agent-review-${{ github.ref }}
+  cancel-in-progress: false
+
+# 需要写 Issue（评论 / 打标签 / 关闭），读取代码
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  review:
+    name: 审核本次提交
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+        with:
+          # diff 通过 GitHub API 获取，无需完整历史，1 层即可
+          fetch-depth: 1
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        # Agent 只依赖 requests（不需要 Flask 等看板依赖）
+        run: pip install --quiet requests
+
+      - name: Agent 自检（离线，不消耗 API）
+        # 每次 push 都跑一遍，确保审核逻辑本身没被改坏
+        run: python -m agent.selftest
+
+      - name: 执行代码审核
+        env:
+          # GitHub 官方自动注入，无需自己配置；权限由上面的 permissions 控制
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+
+          # 审核范围：手动触发时用输入值，push 时用事件自带的 before/after
+          BEFORE_SHA: ${{ github.event.inputs.before_sha || github.event.before }}
+          COMMIT_SHA: ${{ github.event.inputs.after_sha || github.sha }}
+
+          # 大模型配置：需要在仓库 Secrets 里配置 LLM_API_KEY
+          # （LLM_API_URL / LLM_MODEL 不配也能跑，用 || 提供默认值，
+          #   因为未配置的 Secret 会以空字符串注入）
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_URL: ${{ secrets.LLM_API_URL || 'https://api.deepseek.com/v1/chat/completions' }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL || 'deepseek-chat' }}
+
+          # 可选调优项
+          AGENT_PASS_SCORE: ${{ vars.AGENT_PASS_SCORE || '70' }}
+          AGENT_DIFF_MAX_CHARS: ${{ vars.AGENT_DIFF_MAX_CHARS || '12000' }}
+          AGENT_LOG_LEVEL: INFO
+        run: python -m agent.run
