@@ -171,15 +171,11 @@ INFO   （页面顶部也会显示这个地址，并可一键复制）
 
 ### 登录
 
-打开地址后先看到登录页，输入**姓名（真名）或代号**都可以：
+打开地址后先看到登录页，**输入你的真实姓名**（例如「张三」）：
 
-| 输入 | 例子（下表是占位示例，真实姓名在本地 assignees.local.json 里） |
-|------|----------|
-| 真名 | 张三 |
-| 代号 | 小明 |
-
-> 仓库里**不写真实姓名**：代号（小明…）出现在 GitHub 与数据库里，
-> 真名只存在本地 `assignees.local.json`，由界面翻译。推送前记得跑 `python tools/check_names.py`。
+> 姓名对照表在本地 `assignees.local.json`（代号 → 真名）。代号只是 GitHub/数据库内部用的标识，
+> **不需要也不建议记住它**，登录框里也不再接受代号。
+> 万一这个文件丢了/为空，登录会自动退化为「可以用代号登录」，避免整站进不去。
 
 初始密码统一是 `123456`，**登录后请立刻点右上角 🔑 改掉**（还在用初始密码时页面会持续提醒）。
 密码用 werkzeug 的 scrypt 哈希存储，数据库里没有明文；连续输错 5 次会锁定 60 秒。
@@ -202,15 +198,20 @@ python auth.py reset 小美 新密码  # 重置为指定密码
 |------|--------|
 | 查看所有人的任务 | 所有登录用户 |
 | 改状态（Todo/Doing）| **只有负责人本人** |
-| 改负责人 | 未分配的任务谁都能指派；已分配的任务只有本人能改 |
-| 认领任务 | 任何人（把未分配的任务指派给自己） |
+| 认领任务 | 任何人把「未分配」的任务认领给自己 |
+| 把任务指派给别人 | ❌ **谁都不行**（不能替别人接活，也不能把活塞给别人） |
+| 把自己名下的任务放回「未分配」 | 负责人本人 |
+| 新建任务 | 只能建给**自己**，或选「未分配」放进池子 |
 | 删除（仅本地缓存） | 负责人本人，或未分配的任务 |
 | 同步 GitHub | 所有登录用户（只读 GitHub，不改远端） |
 | 修改密码 | 只能改自己的 |
 
 * 别人的任务在页面上**置灰、不可拖拽**，点它的负责人徽章/删除也会提示「只有本人能改」
 * 未分配的任务需要**先认领**（改成自己）才能推进状态；未认领就拖会提示你先指派给自己
-* 后端会独立校验一遍（返回 403），前端的置灰只是提前告诉你，不是安全边界
+* **人员视图里拖到别人的列会被拒绝**（不触发请求，直接提示「只有本人能认领任务」）；
+  要把活交给别人，就把它拖到「未分配」列，让对方自己认领
+* 后端会独立校验一遍（返回 403），前端的限制只是提前告诉你，不是安全边界
+* 如果哪天确实需要「组长派活」，把 `.env` 里的 `ALLOW_ASSIGN_TO_OTHERS` 设为 `1` 即可放开
 
 ### 禁止「假完成」
 
@@ -363,7 +364,7 @@ git config --unset core.hooksPath       # 关闭
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/login` | 登录页（唯一的匿名页面） |
-| POST | `/login` | 提交登录（`username` 可以是代号或真名） |
+| POST | `/login` | 提交登录（`username` 填**真实姓名**；代号已不接受） |
 | GET | `/logout` | 登出 |
 | GET | `/api/me` | 当前登录用户（前端据此显示与控权） |
 | POST | `/api/change-password` | 修改自己的密码 |
@@ -371,7 +372,7 @@ git config --unset core.hooksPath       # 关闭
 | GET | `/api/tasks` | 获取全部任务（支持 `?status=todo`、`?assignee=小明`、`?mine=1`、`?q=关键字`） |
 | POST | `/api/tasks` | 新建任务，同时在 GitHub 创建 Issue（负责人默认是自己；**不能建到 done**） |
 | PUT | `/api/tasks/<issue_number>` | 更新状态和/或负责人（**只有负责人本人**；**不能改成 done**） |
-| PUT | `/api/tasks/<issue_number>/assignee` | 仅更新负责人（未分配的任务谁都能指派） |
+| PUT | `/api/tasks/<issue_number>/assignee` | 仅更新负责人（只能认领给自己，或把自己名下的放回未分配） |
 | DELETE | `/api/tasks/<issue_number>` | 从本地缓存删除（本人或未分配；不影响 GitHub） |
 | POST | `/api/sync` | 从 GitHub 同步（`?with_meta=0` 跳过分支/提交、`?with_reviews=0` 跳过审核报告，可加速） |
 | GET | `/api/assignees` | 负责人名单与各自任务数 |
@@ -381,9 +382,9 @@ git config --unset core.hooksPath       # 关闭
 **所有 `/api/*` 都需要登录**（未登录返回 401，前端会自动跳登录页），只有 `/api/server-info` 与登录页例外。
 
 ```bash
-# 先登录拿到 Cookie，再调用其它接口（给某人设好密码后，他也可以用真名登录）
+# 先用真实姓名登录拿到 Cookie（张三 是占位示例，换成你自己的姓名）
 curl -c cookie.txt -X POST http://localhost:5000/login \
-  -d "username=小明&password=123456"
+  -d "username=张三&password=123456"
 
 # 新建任务（负责人默认是自己）
 curl -b cookie.txt -X POST http://localhost:5000/api/tasks \
@@ -394,9 +395,11 @@ curl -b cookie.txt -X POST http://localhost:5000/api/tasks \
 curl -b cookie.txt -X PUT http://localhost:5000/api/tasks/12 \
   -H "Content-Type: application/json" -d '{"status":"doing"}'
 
-# 认领未分配的任务 / 改负责人
+# 认领未分配的任务（只能填自己；填别人会 403）/ 把自己名下的放回未分配
 curl -b cookie.txt -X PUT http://localhost:5000/api/tasks/12/assignee \
   -H "Content-Type: application/json" -d '{"assignee":"小美"}'
+curl -b cookie.txt -X PUT http://localhost:5000/api/tasks/12/assignee \
+  -H "Content-Type: application/json" -d '{"assignee":"未分配"}'
 
 # 看自己的操作日志
 curl -b cookie.txt "http://localhost:5000/api/logs?mine=1&limit=20"
