@@ -250,7 +250,7 @@ python auth.py reset 小美 新密码  # 重置为指定密码
 | 操作 | 谁能做 |
 |------|--------|
 | 查看所有人的任务 | 所有登录用户 |
-| 改状态（Todo/Doing）| **只有负责人本人** |
+| 改状态（Todo/Doing）| **只有负责人本人**；**已完成的任务谁都不能改**（终态，见下） |
 | 认领任务 | 任何人把「未分配」的任务认领给自己 |
 | 把任务指派给别人 | ❌ **谁都不行**（不能替别人接活，也不能把活塞给别人） |
 | 把自己名下的任务放回「未分配」 | 负责人本人 |
@@ -266,18 +266,26 @@ python auth.py reset 小美 新密码  # 重置为指定密码
 * 后端会独立校验一遍（返回 403），前端的限制只是提前告诉你，不是安全边界
 * 如果哪天确实需要「组长派活」，把 `.env` 里的 `ALLOW_ASSIGN_TO_OTHERS` 设为 `1` 即可放开
 
-### 禁止「假完成」
+### 禁止「假完成」：Done 是单向门
 
-**Done 列不接受任何手动拖入**：
+**Done 列既不接受手动拖入，也不允许把任务移出去**：
 
-- 前端：拖到 Done 列会提示「❌ 不能手动完成：请提交代码等待 Agent 审核，审核通过后会自动移到 Done」，
-  列的标题上带 🔒、斜纹底色，`←` `→` 按钮也不会把你送进 Done
-- 后端：`PUT /api/tasks/<n>` 带 `status=done` 一律返回 **403**，GitHub 标签不会被改
-- 新建任务时也不能直接选 Done
-- 只有 **Agent 审核通过后写入 GitHub 标签**，同步回看板才显示在 Done 列
-  （`DONE_REQUIRES_AGENT=0` 可以关掉这条限制，一般不要关）
+- 不能拖进来：
+  - 前端：拖到 Done 列会提示「不能手动完成：请提交代码等待 Agent 审核，审核通过后会自动移到 Done」，
+    列的标题上带斜纹底色与圆圈 i，`→` 按钮也不会把你送进 Done
+  - 后端：`PUT /api/tasks/<n>` 带 `status=done` 一律返回 **403**，GitHub 标签不会被改
+  - 新建任务时也不能直接选 Done
+  - 只有 **Agent 审核通过后写入 GitHub 标签**，同步回看板才显示在 Done 列
+    （`DONE_REQUIRES_AGENT=0` 可以关掉这条限制，一般不要关）
+- 也不能移出去（**终态**）：
+  - 前端：已完成的任务 `draggable=false`（拖都拖不起来，鼠标是普通箭头），
+    `←` 退回上一列的按钮置灰，卡片上写着「已完成的任务不能再改动」
+  - 后端：`PUT /api/tasks/<n>` 想把 `done` 改成别的状态一律 **403**
+    （**负责人本人也不行** —— 否则随手拖出来就等于绕过了 Agent 审核这道闸门）
+  - 同步不受这条规则影响：Agent 关掉 Issue 后同步照样能把状态写成 `done`
 
-已经完成的任务**可以退回 Doing**（负责人本人操作），用于审核误判时返工。
+确实需要返工（Agent 误判）时有两种办法：在 GitHub 上重新打开 Issue 并改回 `todo`/`doing` 标签再同步，
+或者把 `.env` 里的 `DONE_IS_FINAL` 设为 `0`，负责人本人就能把完成的任务退回 Doing。
 
 ### 操作日志
 
@@ -476,16 +484,18 @@ python tools/test_review_parse.py     # 离线，不需要 Token；覆盖真实�
 python tools/test_auth.py   # 离线，不需要 Token；用临时库，不动 kanban.db，也不写 GitHub
 ```
 
-覆盖八个部分，任何一条不过就以退出码 1 结束：
+覆盖九个部分，任何一条不过就以退出码 1 结束：
 
 1. **路由审计**：所有 `/api/*`（除 `/api/server-info`）未登录必须 401，防止以后新增接口漏加登录校验
 2. 登录（真名 / 代号拒绝 / 密码错误 / 锁定）与密码策略
 3. 权限：改别人的状态、替别人建任务、把未分配的指派给他人，全部 403
 4. 禁止「假完成」：手动改成 done 被拒
-5. 认领 / 放回未分配 / 改负责人
-6. **从看板移除**：默认列表看不到、`include_hidden=1` 能看到、同步不会把它拉回来、恢复后又能看到
-7. **同步只写真正的变化**：第二次同步更新数为 0、`updated_at` 不被刷新、远端变化被正确识别并写日志
-8. 真名不会落进操作日志（只记代号）
+5. **Done 是终态**：已完成的卡片改回 doing/todo 一律 403（负责人本人也不行），但
+   Agent 通过同步写 done 不受影响
+6. 认领 / 放回未分配 / 改负责人
+7. **从看板移除**：默认列表看不到、`include_hidden=1` 能看到、同步不会把它拉回来、恢复后又能看到
+8. **同步只写真正的变化**：第二次同步更新数为 0、`updated_at` 不被刷新、远端变化被正确识别并写日志
+9. 真名不会落进操作日志（只记代号）
 
 ### 改完实时通道后：跑一遍 WebSocket 自检
 
@@ -507,7 +517,8 @@ python tools/test_ws.py     # 离线，不需要 Token；用真服务器 + 真 W
 `templates/index.html` 并执行 `static/app.js`（fetch 与 WebSocket 全用桩，
 不连后端、不写文件），然后模拟输入、`↑` `↓`、`Enter`、`Esc`、点外部、点恢复按钮、
 点开/关闭弹窗、推一条 WebSocket 事件，断言下拉结构、`<mark>` 高亮、卡片闪烁、页脚计数、
-每个圆圈 i 的 `data-hint` 是否齐全、`.active`/`.closing` 弹窗状态、在线名单与重连等 64 项：
+每个圆圈 i 的 `data-hint` 是否齐全、`.active`/`.closing` 弹窗状态、在线名单与重连、
+已完成的任务是否真的拖不动等 70 项：
 
 ```bash
 npm install jsdom          # 只需一次（node_modules 已被 .gitignore 忽略）
@@ -557,7 +568,7 @@ git config --unset core.hooksPath       # 关闭
 | GET | `/api/logs` | 操作日志（`?limit=50&mine=1`） |
 | GET | `/api/tasks` | 获取全部任务（支持 `?status=todo`、`?assignee=小明`、`?mine=1`、`?q=关键字`、`?include_hidden=1` 连已移除的一起返回） |
 | POST | `/api/tasks` | 新建任务，同时在 GitHub 创建 Issue（负责人默认是自己；**不能建到 done**） |
-| PUT | `/api/tasks/<issue_number>` | 更新状态和/或负责人（**只有负责人本人**；**不能改成 done**） |
+| PUT | `/api/tasks/<issue_number>` | 更新状态和/或负责人（**只有负责人本人**；**不能改成 done**，**已 done 的也不能改成别的**） |
 | PUT | `/api/tasks/<issue_number>/assignee` | 仅更新负责人（只能认领给自己，或把自己名下的放回未分配） |
 | DELETE | `/api/tasks/<issue_number>` | **从看板移除**（本人或未分配）：只把本地记录标记为隐藏，GitHub 上的 Issue 不动，可恢复 |
 | POST | `/api/tasks/<issue_number>/restore` | 恢复被移除的某张卡片（`PUT` 同样可用） |
@@ -584,7 +595,7 @@ curl -b cookie.txt -X POST http://localhost:5000/api/tasks \
   -H "Content-Type: application/json" \
   -d '{"title":"完成点云配准模块","description":"ICP + 粗配准","status":"todo"}'
 
-# 改状态（只能改自己的；改成 done 会被 403 拒绝）
+# 改状态（只能改自己的；改成 done 会被 403，已 done 的改成别的也会被 403）
 curl -b cookie.txt -X PUT http://localhost:5000/api/tasks/12 \
   -H "Content-Type: application/json" -d '{"status":"doing"}'
 
