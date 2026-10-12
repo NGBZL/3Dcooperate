@@ -68,6 +68,7 @@ kanban/
 | 🖱️ 拖拽改属性 | 状态视图拖到某列 = 改状态；人员视图拖到某人列 = 改负责人 |
 | 📱 移动端可用 | 响应式布局；触屏用卡片上的 `←` `→` 按钮（状态视图切状态，人员视图切负责人） |
 | 🔄 一键同步 | 从 GitHub 拉取全部 Issue，含**从正文解析负责人** |
+| ⚡ 实时刷新 | WebSocket 通道：别人改状态 / 认领 / 新建 / 移除 / 同步时，自己的看板立刻更新，页脚还能看到谁在线 |
 | ➕ 新建任务 | 同时在 GitHub 创建 Issue，自动打状态标签并把负责人写进正文 |
 | 🌿 分支 / 提交关联 | 自动识别分支名中的 Issue 编号，并汇总提交信息里的 `#编号` |
 | 🤖 卡片显示 AI 评语 | 同步时读回 Agent 的审核报告，卡片上显示通过/不通过徽章，点击展开评语 |
@@ -338,6 +339,51 @@ python auth.py reset 小美 新密码  # 重置为指定密码
 - 想彻底删掉一张卡片（同步也不该再出现）只能在 GitHub 上关闭或删除 Issue；
   看板上的 × 只是**本地移除**，语义是「这张我暂时不想看」，随时可恢复
 
+### 实时通道：WebSocket
+
+看板之间用 WebSocket 保持同步：别人改状态、认领、新建、移除、点同步时，
+**自己的看板立刻跟着变**，不用等轮询（页脚会显示 `● 实时已连接 · 在线 2 人（张三、李四）`）。
+
+| 项目 | 做法 | 为什么 |
+|------|------|--------|
+| 协议 | 浏览器原生 `WebSocket`，端点 `GET /ws` | 不引 socket.io，**不需要 CDN**：组员在只有热点、没外网的手机上也能用 |
+| 服务端实现 | `simple_websocket.Server(environ)`，Werkzeug 开发服务器直接跑 | 只多一个 `simple-websocket` 依赖，不用 gevent/eventlet，也不用换 WSGI 服务器 |
+| 事件内容 | 只推「谁、改了哪张、做了什么」 | **不推任务数据**：任务真值只有一份（SQLite + GitHub），客户端收到后自己重拉 `/api/tasks`，不会出现两份状态打架 |
+| 鉴权 | 握手**之前**校验 Flask session，未登录直接 401 | 不会「先建连接再踢人」；WS 通道**不接受任何写操作**，写操作一律走带权限校验的 HTTP 接口 |
+| 线程安全 | 每条连接一个发送锁 | 广播可能同时来自多个 HTTP 请求线程，而 `send` 不是线程安全的 |
+| 心跳 | 协议级 ping（25s）+ 客户端应用层 ping | 双方都能尽快发现断线；代理掐空闲连接也不怕 |
+| 断线 | 客户端指数退避重连（1s→30s 带抖动），连不上就退回 30 秒轮询 | **WebSocket 挂了功能照样可用**，只是实时性差一点 |
+| 真实姓名 | 事件里只有代号，真名由前端用自己的映射表翻译 | 跟「真名不出本地」的约定一致 |
+
+事件格式（JSON 文本帧）：
+
+```jsonc
+// 服务端 → 客户端
+{"type": "hello",         "protocol": 1, "you": {...}, "server_time": 1730000000.0}
+{"type": "presence",      "count": 2, "online": 2, "users": [{"username": "小明", "connections": 1}]}
+{"type": "tasks_changed", "action": "update_task", "issue": 12, "by": "小明", "detail": "状态=doing", "at": ...}
+{"type": "pong",          "at": ...}
+{"type": "error",         "message": "..."}
+
+// 客户端 → 服务端
+{"type": "ping"}     // 保活
+{"type": "whoami"}   // 想重新拿一次 hello
+```
+
+事件由**服务端**在写操作成功后广播（新建 / 改状态 / 改负责人 / 移除 / 恢复 / 同步），
+所以即使改动来自 GitHub 网页或 Agent，只要有人点了同步，其他人也会立刻看到。
+
+实现上的两个坑（都已在代码注释里写明）：
+
+1. **路由必须声明 `websocket=True`**（`@app.route("/ws", websocket=True)`）。
+   握手请求带 `Connection: Upgrade` + `Upgrade: websocket`，Werkzeug 会把这次请求的
+   url_scheme 认成 `ws`，只匹配声明了 `websocket=True` 的路由；不写这个参数会在
+   **进入视图之前**就抛 `WebsocketMismatch`（表现为 400，从日志里看不出原因）。
+2. **`app.run(..., threaded=True)`**：每条 WebSocket 连接要占一个线程，必须开多线程。
+
+关掉实时通道也能跑：没装 `simple-websocket` 时 `/ws` 返回 503，前端自动退回轮询，
+`/api/health` 的 `realtime.available` 会是 `false`。
+
 ### 帮助提示都在圆圈 i 里
 
 页面上不铺开说明文字，所有「怎么用 / 怎么回事」都挂在对应控件旁边的圆圈 i 上，
@@ -441,14 +487,32 @@ python tools/test_auth.py   # 离线，不需要 Token；用临时库，不动 k
 7. **同步只写真正的变化**：第二次同步更新数为 0、`updated_at` 不被刷新、远端变化被正确识别并写日志
 8. 真名不会落进操作日志（只记代号）
 
+### 改完实时通道后：跑一遍 WebSocket 自检
+
+```bash
+python tools/test_ws.py     # 离线，不需要 Token；用真服务器 + 真 WebSocket 连接，不动真库
+```
+
+它会在线程里起一个真实的 Werkzeug 服务器（数据库用副本），然后用
+`simple_websocket.Client` 真的连上去，断言 26 项：未登录被拒、`hello` / `presence`、
+第二条连接上线后在线数变化、**通过 HTTP 改一张卡片后另一个连接收到 `tasks_changed`**
+（且事件里只有代号）、`ping`/`pong`、未知消息回 `error`、断开后在名单里回收、
+`/api/health` 里的实时通道统计。
+
 ### 改完前端交互后：跑一遍界面自检（可选）
 
-搜索下拉、点结果跳转、从看板移除 / 恢复、圆圈 i 的说明、弹窗开合动画这类纯前端行为，
+搜索下拉、点结果跳转、从看板移除 / 恢复、圆圈 i 的说明、弹窗开合动画、
+实时通道的接线（连 `/ws`、在线名单、收到事件触发刷新、断线重连）这类纯前端行为，
 光靠 `node --check` 是查不出来的。`tools/test_ui.js` 会在 jsdom 里真的加载
-`templates/index.html` 并执行 `static/app.js`（fetch 全用桩数据，不连后端、不写文件），
-然后模拟输入、`↑` `↓`、`Enter`、`Esc`、点外部、点恢复按钮、点开/关闭弹窗，
-断言下拉结构、`<mark>` 高亮、卡片闪烁、页脚计数、每个圆圈 i 的 `data-hint` 是否齐全、
-`.active`/`.closing` 弹窗状态等 54 项：
+`templates/index.html` 并执行 `static/app.js`（fetch 与 WebSocket 全用桩，
+不连后端、不写文件），然后模拟输入、`↑` `↓`、`Enter`、`Esc`、点外部、点恢复按钮、
+点开/关闭弹窗、推一条 WebSocket 事件，断言下拉结构、`<mark>` 高亮、卡片闪烁、页脚计数、
+每个圆圈 i 的 `data-hint` 是否齐全、`.active`/`.closing` 弹窗状态、在线名单与重连等 64 项：
+
+```bash
+npm install jsdom          # 只需一次（node_modules 已被 .gitignore 忽略）
+node tools/test_ui.js
+```
 
 ```bash
 npm install jsdom          # 只需一次（node_modules 已被 .gitignore 忽略）
@@ -502,9 +566,11 @@ git config --unset core.hooksPath       # 关闭
 | GET | `/api/assignees` | 负责人名单与各自任务数 |
 | GET | `/api/health` | 健康检查（`?deep=1` 会真实请求 GitHub 校验 Token） |
 | GET | `/api/server-info` | 本机局域网访问地址（**无需登录**，登录页也要显示它） |
+| GET | `/ws` | **实时通道（WebSocket）**：推送 `tasks_changed` 与在线名单；未登录在握手前就 401 |
 
 **所有 `/api/*` 都需要登录**（未登录返回 401，前端会自动跳登录页），只有三处例外：
-登录页 `/login`、`/logout` 与 `/api/server-info`（登录页要显示局域网地址）。
+登录页 `/login`、`/logout` 与 `/api/server-info`（登录页要显示局域网地址）；
+`/ws` 同样要求登录，只是在**升级协议之前**就用 401 拒绝。
 新增接口时记得加 `@auth.api_login_required`：`python tools/test_auth.py` 会自动审计所有路由，
 漏加装饰器会直接判 FAIL。
 
@@ -868,6 +934,13 @@ GitHub 上的 Issue 一个字都不动，也**不会被同步拉回来**。
 **Q：关闭的 Issue 怎么处理？**
 A：默认 `SYNC_ISSUE_STATE=all`，关闭的 Issue 会视为 `done` 保留在看板上；设为 `open` 则只同步未关闭的 Issue。
 
+**Q：别人改了我这张卡，我要刷新页面吗？**
+A：不用。看板和服务器之间有一条 WebSocket（`/ws`），别人改状态、认领、新建、移除、
+点同步之后你这边会**自动刷新**，底部还会提示是谁改了什么。
+页脚 `● 实时已连接 · 在线 N 人` 就是在告诉你这条通道是通的；
+如果它变成「实时连接断开，已退回轮询」，说明 WebSocket 被网络掐了（有些代理会这样），
+此时看板退化成每 30 秒拉一次，功能不受影响，网络恢复后会自动重连。
+
 **Q：手机上看板能用吗？**
 A：可以。窄屏下列会竖向堆叠，拖拽在触屏上不可用，请用卡片右下角的 `←` `→` 按钮：
 状态视图里切换状态，人员视图里切换负责人（顺序为 6 人 + 未分配）。
@@ -876,8 +949,8 @@ A：可以。窄屏下列会竖向堆叠，拖拽在触屏上不可用，请用�
 
 ## 技术栈
 
-- 后端：Python 3.9+ / Flask / Flask-CORS / requests
-- 前端：原生 HTML + CSS + JavaScript（无任何框架）
+- 后端：Python 3.9+ / Flask / Flask-CORS / requests / **simple-websocket（实时通道）**
+- 前端：原生 HTML + CSS + JavaScript（无任何框架，实时通道用浏览器原生 WebSocket）
 - 存储：SQLite（本地缓存，支持旧库自动迁移）
 - Agent：Python + requests（不引入 PyGithub），兼容 DeepSeek / OpenAI 协议
 - 数据源：GitHub REST API v3 + GitHub Actions

@@ -11,6 +11,10 @@ Flask-Cors>=4.0.0,<7.0.0
 # GitHub REST API 调用（看板与 Agent 共用）
 requests>=2.31.0,<3.0.0
 
+# 实时通道：Flask 里跑 WebSocket 的最小实现（看板 /ws 用它收发事件）
+# 只依赖 wsproto，不引 socket.io、不需要 gevent/eventlet，Werkzeug 开发服务器直接可用
+simple-websocket>=1.0.0,<2.0.0
+
 # 从 .env 文件读取配置（看板使用；Agent 自带零依赖的 .env 解析器）
 python-dotenv>=1.0.0,<2.0.0
 
