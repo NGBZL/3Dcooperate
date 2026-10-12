@@ -114,6 +114,14 @@ def scan_text(text: str, names: list[str], where: str) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     """命令行入口。"""
+    # Windows 控制台默认 GBK，✅/⚠️ 这类字符会让 print 抛 UnicodeEncodeError，
+    # 结果工具明明检查通过了却以退出码 1 结束（还甩一段 traceback），所以先把输出切成 UTF-8。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):  # pragma: no cover - 老版本 Python / 特殊 stdout
+        pass
+
     parser = argparse.ArgumentParser(description="检查真实姓名是否泄漏进 Git")
     parser.add_argument("--staged", action="store_true", help="只检查暂存区改动")
     parser.add_argument("--hook", action="store_true", help="由 pre-commit 钩子调用")
