@@ -84,32 +84,35 @@ def recv_until(client, kind: str, timeout: float = 5.0):
     return None
 
 
-def prepare_user() -> tuple[str, str]:
+def prepare_user() -> tuple[str, str, int]:
     """
-    在副本库里挑一个**手里有任务**的用户，给它设个测试密码。
+    在副本库里准备一个测试用户 + 一张属于他的任务，并给它设个测试密码。
 
-    :return: (代号, 登录用的真名)
+    **不依赖真库里的现有数据**：真库可能刚换过任务仓库、缓存是空的，
+    所以这里自己造夹具（Issue 编号用 9901 这种不会和真任务撞车的号）。
+
+    :return: (代号, 登录用的真名, 测试任务编号)
     """
     from werkzeug.security import generate_password_hash
 
+    from config import assignee_display
+    import database
+
     conn = sqlite3.connect(COPY)
-    row = conn.execute(
-        "SELECT assignee FROM tasks WHERE hidden = 0 AND assignee != '' LIMIT 1"
-    ).fetchone()
+    row = conn.execute("SELECT username FROM users ORDER BY id LIMIT 1").fetchone()
     code = row[0] if row else None
     if not code:
-        row = conn.execute("SELECT username FROM users ORDER BY id LIMIT 1").fetchone()
-        code = row[0] if row else None
-    if not code:
-        raise SystemExit("副本库里既没有任务也没有用户，无法测试")
+        raise SystemExit("副本库里没有用户，无法测试")
 
     conn.execute("UPDATE users SET password_hash = ? WHERE username = ?",
                  (generate_password_hash("ws-test-1234"), code))
     conn.commit()
     conn.close()
 
-    from config import assignee_display
-    return code, (assignee_display(code) or code)
+    issue = 9901
+    database.upsert_task(issue, "实时通道自检任务", "", "todo",
+                         assignee=code, html_url="", state="open")
+    return code, (assignee_display(code) or code), issue
 
 
 httpd = make_server("127.0.0.1", PORT, server.app, threaded=True)
@@ -121,8 +124,16 @@ print("[0] 环境")
 print("=" * 68)
 check("simple-websocket 可用（服务端能开 WS）", server.realtime.WEBSOCKET_AVAILABLE)
 
-code, login_name = prepare_user()
-check("副本库准备完成（挑到有任务的用户并设了测试密码）", bool(code))
+# 打桩：本用例只验证实时通道，**绝不真的写 GitHub**
+# （以前这里会真的改真仓库的 Issue 标签，换仓库后编号还可能指向不存在的 Issue）
+import github_client  # noqa: E402
+
+github_client.ensure_status_labels = lambda: []
+github_client.set_issue_status = lambda number, status: {"number": number}
+github_client.set_issue_assignee = lambda number, assignee, description=None: {"number": number}
+
+code, login_name, test_issue = prepare_user()
+check("副本库准备完成（造了测试用户 + 测试任务并设了密码）", bool(code))
 
 session = requests.Session()
 resp = session.post(f"{BASE_URL}/login",
@@ -190,9 +201,9 @@ try:
     visible = [t for t in tasks if not t.get("hidden")]
     check("拿到卡片列表", bool(visible))
 
-    target = next((t for t in visible
-                   if (t.get("assignee") or "") in (code, "")), None)
-    check("找到一张当前用户可操作的卡片", target is not None)
+    target = next((t for t in visible if t.get("issue_number") == test_issue), None)
+    check("找到自己造的测试任务", target is not None,
+          f"测试任务 #{test_issue} 不在列表里：{[t.get('issue_number') for t in visible]}")
 
     if target:
         new_status = "doing" if target.get("status") != "doing" else "todo"

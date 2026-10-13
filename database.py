@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -284,6 +285,35 @@ def set_meta(key: str, value: str) -> None:
         )
 
 
+def count_tasks() -> int:
+    """任务缓存条数（含已从看板移除的）。"""
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+
+
+def infer_cached_repo() -> str:
+    """
+    从缓存里的 ``html_url`` 反推「这批任务其实是哪个仓库的」。
+
+    为什么要反推：``board_meta`` 里的仓库名是「上一次运行时写下的」，
+    如果看板中途换过仓库、或者先前的版本没写过 meta，光看 meta 并不可靠；
+    而每个任务的 html_url（``https://github.com/owner/repo/issues/12``）是硬证据。
+
+    :return: 唯一推断出的 ``owner/repo``（小写）；没有 url、或混杂多个仓库时返回空串
+    """
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT html_url FROM tasks WHERE COALESCE(html_url, '') != '' LIMIT 50"
+        ).fetchall()
+
+    found: set[str] = set()
+    for row in rows:
+        match = re.search(r"github\.com/([^/\s]+/[^/\s]+)/issues/\d+", row["html_url"] or "")
+        if match:
+            found.add(match.group(1).lower())
+    return found.pop() if len(found) == 1 else ""
+
+
 def clear_tasks() -> int:
     """
     清空任务缓存（**不动**用户、也不动操作日志）。
@@ -302,28 +332,48 @@ def clear_tasks() -> int:
 
 def bind_repo(repo: str) -> dict[str, Any]:
     """
-    把本地缓存与「当前任务仓库」绑定，换仓库时自动清空旧缓存。
+    把本地缓存与「当前任务仓库」绑定，必要时清空旧缓存。
 
-    三种情况：
-      * 第一次运行（没记录过仓库）→ 记下来，不动数据
-      * 仓库没变 → 什么都不做
-      * 仓库变了 → 清空任务缓存（避免两个仓库的同号 Issue 互相污染）并重新记录
+    判断依据有两份，**证据优先**：
+      1. ``board_meta.repo``：上次运行时记下的仓库（可能缺失或过时）
+      2. 缓存里每个任务的 ``html_url``：这批任务到底属于哪个仓库（硬证据）
+
+    规则：
+      * 记下的仓库变了 → 清空
+      * html_url 明确指向**别的**仓库 → 清空（meta 不可信时以证据为准）
+      * 从没记过、也推断不出来、但缓存里已有数据 → 清空（无法确认归属，
+        宁可从 GitHub 重拉，也不能拿旧编号去写新仓库的 Issue）
+      * 其余情况（同仓库 / 空库）→ 保持不动
 
     :param repo: 当前配置的任务仓库，形如 ``owner/name``
-    :return: {"repo": 当前仓库, "previous": 旧仓库, "changed": 是否换了, "cleared": 清掉的条数}
+    :return: {"repo", "previous", "inferred", "changed", "cleared", "reason"}
     """
     previous = get_meta("repo", "")
-    if not previous:
-        set_meta("repo", repo)
-        return {"repo": repo, "previous": "", "changed": False, "cleared": 0}
-    if previous == repo:
-        return {"repo": repo, "previous": previous, "changed": False, "cleared": 0}
+    inferred = infer_cached_repo()
+    cached = count_tasks()
+    target = (repo or "").lower()
 
-    cleared = clear_tasks()
+    reason = ""
+    if inferred:
+        # html_url 是硬证据：和当前仓库一致就保留（哪怕 meta 记录过时/写错），
+        # 指向别的仓库就清掉
+        if inferred != target:
+            reason = f"缓存里的任务其实属于 {inferred}，不是当前仓库 {repo}"
+    elif previous and previous.lower() != target:
+        reason = f"配置的仓库从 {previous} 换成了 {repo}"
+    elif not previous and cached:
+        reason = "缓存里已有任务，但既没有仓库记录、也推断不出归属"
+
+    if reason:
+        cleared = clear_tasks()
+        set_meta("repo", repo)
+        logger.warning("重建缓存：%s（已清空 %d 条旧任务）", reason, cleared)
+        return {"repo": repo, "previous": previous, "inferred": inferred,
+                "changed": True, "cleared": cleared, "reason": reason}
+
     set_meta("repo", repo)
-    logger.warning("任务仓库已从 %s 换成 %s：旧缓存已清空（%d 条），请重新同步",
-                   previous, repo, cleared)
-    return {"repo": repo, "previous": previous, "changed": True, "cleared": cleared}
+    return {"repo": repo, "previous": previous, "inferred": inferred,
+            "changed": False, "cleared": 0, "reason": ""}
 
 
 # ============================================================

@@ -292,6 +292,55 @@ check("变更写进了操作日志",
       [item["action"] for item in logs[:6]])
 
 print()
+print("[9] 换任务仓库时的缓存重建（证据优先：html_url 说了算）")
+print("=" * 68)
+# 造两张「属于 A 仓」的缓存（html_url 是硬证据）
+database.upsert_task(801, "A 仓的任务一", "", "todo", assignee=ME,
+                     html_url="https://github.com/ownerA/repoA/issues/801")
+database.upsert_task(802, "A 仓的任务二", "", "doing", assignee=ME,
+                     html_url="https://github.com/ownerA/repoA/issues/802")
+check("能从 html_url 反推出缓存属于哪个仓库",
+      database.infer_cached_repo() == "ownera/repoa", database.infer_cached_repo())
+
+users_before = len(database.list_users())
+logs_before = len(database.recent_logs(limit=999))
+
+# ① 记录里的仓库与配置一致、证据也一致 → 不动数据
+database.set_meta("repo", "ownerA/repoA")
+same = database.bind_repo("ownerA/repoA")
+check("同仓库启动：不清缓存", same["changed"] is False and same["cleared"] == 0, same)
+check("同仓库启动：任务还在", database.get_task_by_issue(801) is not None)
+
+# ② 记录被改坏了（说是别的仓库），但证据指向 A 仓 → 以证据为准，不清
+database.set_meta("repo", "ownerB/repoB")
+fixed = database.bind_repo("ownerA/repoA")
+check("记录过时但证据一致：不清缓存", fixed["changed"] is False, fixed)
+check("记录被修正回当前仓库", database.get_meta("repo") == "ownerA/repoA")
+
+# ③ 换成 B 仓 → 清空任务，但用户与日志保留
+switched = database.bind_repo("ownerB/repoB")
+check("换仓库：报告为已重建", switched["changed"] is True, switched)
+check("换仓库：任务被清空", database.count_tasks() == 0, database.count_tasks())
+check("换仓库：用户没被动", len(database.list_users()) == users_before)
+check("换仓库：操作日志没被动", len(database.recent_logs(limit=999)) == logs_before)
+check("换仓库：记录已更新", database.get_meta("repo") == "ownerB/repoB")
+
+# ④ 没有记录、又能推断出归属（A 仓），但配置是 B 仓 → 依然要清
+database.upsert_task(803, "A 仓的任务三", "", "todo", assignee=ME,
+                     html_url="https://github.com/ownerA/repoA/issues/803")
+database.set_meta("repo", "")
+rebuilt = database.bind_repo("ownerB/repoB")
+check("没记录 + 证据指向别的仓库：清空并重建",
+      rebuilt["changed"] is True and rebuilt["cleared"] == 1, rebuilt)
+
+# ⑤ 没有记录、也没有证据（html_url 为空）、但缓存非空 → 无法确认归属，清掉
+database.upsert_task(804, "没有 html_url 的老缓存", "", "todo", assignee=ME)
+database.set_meta("repo", "")
+unknown = database.bind_repo("ownerC/repoC")
+check("无法确认归属：宁可从 GitHub 重拉（清空）",
+      unknown["changed"] is True and unknown["cleared"] == 1, unknown)
+
+print()
 print("=" * 68)
 print("清理测试数据")
 shutil.rmtree(WORKDIR, ignore_errors=True)

@@ -1262,12 +1262,13 @@ def bootstrap() -> None:
         logger.warning("=" * 56)
 
     database.init_db()
-    # 绑定任务仓库：换了仓库就清空旧缓存（Issue 编号只在单个仓库内唯一）
+    # 绑定任务仓库：换了仓库（或缓存其实属于别的仓库）就清空旧缓存
+    # Issue 编号只在单个仓库内唯一，混着用会把状态/负责人写到无关的 Issue 上
     switch = database.bind_repo(GITHUB_REPO or "")
     if switch["changed"]:
         logger.warning("=" * 56)
-        logger.warning("检测到任务仓库变更：%s → %s", switch["previous"], switch["repo"])
-        logger.warning("已清空本地任务缓存 %d 条（旧仓库的任务不再显示，点「同步」即可拉取新仓库）",
+        logger.warning("本地任务缓存已重建：%s", switch["reason"])
+        logger.warning("清掉旧任务 %d 条；用户与操作日志保留。点一次「同步」即可拉取新仓库",
                        switch["cleared"])
         logger.warning("=" * 56)
     # 首次启动时创建 6 个初始用户（已存在则跳过）
