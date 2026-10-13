@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>登录 · 项目看板</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="login-page">
+
+<main class="login-card">
+    <div class="login-brand">
+        <span class="logo" aria-hidden="true"></span>
+        <h1>项目看板</h1>
+        <p class="login-sub">请用你的姓名登录</p>
+    </div>
+
+    {% if error %}
+    <div class="login-error" role="alert">{{ error }}</div>
+    {% endif %}
+
+    <form method="post" action="{{ url_for('login_page') }}" autocomplete="on">
+        <!-- 登录后跳回原来要访问的页面；只接受站内地址，后端会再校验一次 -->
+        <input type="hidden" name="next" value="{{ next_url }}">
+
+        <label for="username">姓名</label>
+        <input type="text" id="username" name="username" value="{{ username }}"
+               placeholder="请输入你的姓名，例如：张三" autocomplete="username" autofocus required>
+
+        <label for="password">密码</label>
+        <input type="password" id="password" name="password"
+               placeholder="初始密码请向管理员索取" autocomplete="current-password" required>
+
+        <button type="submit" class="btn btn-primary login-submit">登 录</button>
+    </form>
+
+    <div class="login-foot">
+        <span id="login-server-info">正在获取访问地址…</span>
+    </div>
+</main>
+
+<script>
+    // 登录页也显示一下局域网地址，方便组员确认自己连对了地方
+    (async function showServerInfo() {
+        const target = document.getElementById('login-server-info');
+        try {
+            const resp = await fetch('/api/server-info');
+            const info = await resp.json();
+            if (info.local_only) {
+                target.textContent = '服务器还没连上热点/Wi-Fi';
+            } else {
+                target.textContent = info.url;
+            }
+        } catch (error) {
+            target.textContent = '';
+        }
+    })();
+</script>
+
+</body>
+</html>

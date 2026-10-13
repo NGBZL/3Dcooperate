@@ -169,8 +169,40 @@ cp .env.example .env        # macOS / Linux
 
 ```
 GITHUB_TOKEN=ghp_你的token
-GITHUB_REPO=你的用户名/仓库名
+GITHUB_REPO=你的用户名/任务仓库名
 ```
+
+> ⚠️ `GITHUB_REPO` 填的是**任务仓库**，不是看板代码仓库 —— 见下面的「仓库拆分」。
+
+### 仓库拆分：看板代码 / 任务代码分开放
+
+看板自己的代码和「项目的代码 + 任务」是**两个仓库**，别混在一起：
+
+| 仓库 | 放什么 | 例子（本项目的实际配置） |
+|------|--------|--------------------------|
+| 看板代码仓库 | `server.py`、`static/`、`templates/`、`database.py`、`auth.py`、`realtime.py`、`agent/`、`tools/` | `NGBZL/3Dcooperate` |
+| **任务仓库**（`GITHUB_REPO` 填这个） | 每张任务卡 = 一个 Issue；项目自己的分支、提交、PR | `NGBZL/3D-reconstruction-code` |
+
+为什么要拆：看板仓库里是「看板这个工具」，任务仓库里是「被看板管理的项目」。
+混在一起会让任务 Issue 和看板自身的提交记录互相干扰，也没法把仓库单独分享给组员。
+
+**换任务仓库时会发生什么**：看板把本地 SQLite 当作 GitHub 的缓存，
+而 **Issue 编号只在单个仓库内唯一**（A 仓的 #1 和 B 仓的 #1 是两件不相干的事）。
+所以看板会在启动时检查「当前 `GITHUB_REPO`」与「缓存属于哪个仓库」是否一致：
+
+* 一致 → 什么都不做
+* 不一致 → **自动清空任务缓存**（用户、密码、操作日志都保留），并打一条醒目日志，
+  点一次「同步」就会从新仓库重新拉取
+
+状态记在 SQLite 的 `board_meta` 表里（`repo` 键），清缓存只清 `tasks` 表。
+
+**Agent 审核栈要放在任务仓库里**：`.github/workflows/agent-review.yml` + `agent/` 必须存在于
+**任务仓库**，因为它要审核的是推到任务仓库的代码、并关闭任务仓库里的 Issue。
+同时别忘了在任务仓库的 `Settings → Secrets and variables → Actions` 里配 `LLM_API_KEY`
+（Secret 不能跨仓库复制，需要在新仓库里再配一次）。
+
+**Token 权限**：`GITHUB_TOKEN` 至少要能读写**任务仓库**的 Issues；
+如果还想用 API 往仓库里推改动，再加 Contents 读写（改 workflow 还需要 Workflows 读写）。
 
 ### 3. 获取 GitHub Token
 

@@ -1,0 +1,1744 @@
+/* ============================================================
+   项目看板样式
+
+   配色原则：低饱和、低对比，稳重淡雅
+   · 强调色 = Tiffany 蓝（--accent / --doing），只在需要「引人注意」的地方出现
+   · 状态色：Todo = 淡赭石 / Doing = Tiffany 蓝 / Done = 灰绿，三者饱和度接近，靠色相区分
+   · 人员视图：低饱和紫灰系（每条列头色相不同，由 JS 通过 --hue 注入）
+   · 中性色偏冷灰，页面底色比卡片更暗一点点，靠阴影与描边分层
+
+   动效原则：参考 Apple 弹窗
+   · 统一缓动 --ease（先快后慢的「落位感」），时长 --dur
+   · 弹窗：遮罩模糊 + 对话框轻微放大淡入；关闭时反向淡出
+   · 按钮按下轻微缩小，卡片悬停轻微上浮，不做花哨位移
+
+   图标原则：不用 emoji，语义交给颜色圆点、色条、文字和 hairline 描边
+   ============================================================ */
+
+:root {
+    /* 强调色：Tiffany 蓝 */
+    --accent: #0abab5;          /* 品牌色本体，用于焦点环、选中态 */
+    --accent-deep: #0d8f8b;     /* 需要更高对比时（文字、按钮底色） */
+    --accent-soft: #e6f5f4;     /* 极浅底色 */
+    --accent-line: #bfe6e4;     /* 浅色描边 */
+    --focus-ring: 0 0 0 3px rgba(10, 186, 181, .18);
+
+    /* 状态色（低饱和三兄弟） */
+    --todo: #b5945f;
+    --todo-bg: #f6f0e6;
+    --todo-ink: #8a6f45;
+    --doing: #4fa8a3;
+    --doing-bg: #e9f4f3;
+    --doing-ink: #2f7a76;
+    --done: #7fa98f;
+    --done-bg: #edf3ef;
+    --done-ink: #4f7a60;
+
+    /* 人员视图：低饱和紫灰 + 失败/警示态 */
+    --person: #7d81a8;
+    --person-bg: #efeff6;
+    --person-line: #dcdde9;
+    --danger: #b4676a;
+    --danger-bg: #f7efef;
+    --danger-ink: #93494c;
+    --warn: #ab8f56;
+    --warn-bg: #f7f2e8;
+    --warn-ink: #856c3c;
+
+    --text: #34383f;
+    --text-soft: #6b7280;
+    --text-mute: #9aa1aa;
+    --line: #e5e7eb;
+    --line-soft: #f0f1f4;
+    --page-bg: #f4f6f7;
+    --column-bg: #eef0f2;
+    --surface: #fff;
+
+    --radius: 14px;
+    --radius-sm: 10px;
+    --shadow-sm: 0 1px 2px rgba(28, 34, 40, .05), 0 1px 3px rgba(28, 34, 40, .04);
+    --shadow-md: 0 4px 14px rgba(28, 34, 40, .09);
+    --shadow-lg: 0 24px 60px rgba(24, 30, 36, .20);
+
+    /* Apple 风格：先快后慢，落位不弹跳 */
+    --ease: cubic-bezier(.32, .72, 0, 1);
+    --dur: .28s;
+    --dur-fast: .16s;
+
+    /* ---- 鼠标指针（内联 SVG，白底 + 粗黑描边）----
+       系统自带的 grab / not-allowed 是「白手 / 白圈」，在浅色看板上几乎看不见，
+       所以自己画：四向移动箭头（可拖）与禁止符号（不可动），都带 1.8px 黑框。
+       括号里的原生关键字是兜底：不支持 SVG 指针的浏览器照旧用系统指针。 */
+    --cursor-move: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><g fill='%23ffffff' stroke='%231f2328' stroke-width='1.7' stroke-linejoin='round'><path d='M12 2.6 15.1 6.4H8.9z'/><path d='M12 21.4 8.9 17.6h6.2z'/><path d='M2.6 12 6.4 8.9v6.2z'/><path d='M21.4 12 17.6 15.1V8.9z'/><rect x='10.5' y='6' width='3' height='12' rx='1.2'/><rect x='6' y='10.5' width='12' height='3' rx='1.2'/></g></svg>") 12 12, move;
+    --cursor-move-active: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><g fill='%231f2328' stroke='%23ffffff' stroke-width='1.4' stroke-linejoin='round'><path d='M12 2.6 15.1 6.4H8.9z'/><path d='M12 21.4 8.9 17.6h6.2z'/><path d='M2.6 12 6.4 8.9v6.2z'/><path d='M21.4 12 17.6 15.1V8.9z'/><rect x='10.5' y='6' width='3' height='12' rx='1.2'/><rect x='6' y='10.5' width='12' height='3' rx='1.2'/></g></svg>") 12 12, move;
+    --cursor-no: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><circle cx='12' cy='12' r='8.6' fill='%23ffffff' stroke='%231f2328' stroke-width='1.8'/><line x1='6.1' y1='17.9' x2='17.9' y2='6.1' stroke='%231f2328' stroke-width='1.8'/></svg>") 12 12, not-allowed;
+}
+
+/* ============================ 基础 ============================ */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+html {
+    -webkit-text-size-adjust: 100%;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--page-bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+a {
+    color: var(--accent-deep);
+    text-decoration: none;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+
+code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .92em;
+    background: var(--line-soft);
+    border-radius: 5px;
+    padding: 0 4px;
+}
+
+/* ============================ 顶栏 ============================ */
+.topbar {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    /* 半透明 + 模糊：内容滚到下面时像浮在毛玻璃上 */
+    background: rgba(255, 255, 255, .78);
+    -webkit-backdrop-filter: blur(16px) saturate(160%);
+    backdrop-filter: blur(16px) saturate(160%);
+    border-bottom: 1px solid var(--line);
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
+/* 用 CSS 画的看板标记代替 emoji：一块 Tiffany 蓝圆角方块里三条白色短杠 */
+.logo {
+    position: relative;
+    display: block;
+    flex: none;
+    width: 24px;
+    height: 24px;
+    border-radius: 8px;
+    background: linear-gradient(160deg, #2ec4c0 0%, #0d8f8b 100%);
+    box-shadow: 0 2px 6px rgba(10, 186, 181, .28);
+}
+
+.logo::before,
+.logo::after {
+    content: "";
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    width: 3px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, .92);
+}
+
+.logo::before {
+    left: 6px;
+}
+
+.logo::after {
+    left: 15px;
+}
+
+.brand-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.brand-text h1 {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: .4px;
+}
+
+.repo-name {
+    font-size: 12px;
+    color: var(--text-mute);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 46vw;
+}
+
+.toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+/* ============================ 当前用户 ============================ */
+.user-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    background: var(--person-bg);
+    border: 1px solid var(--person-line);
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--person);
+    max-width: 100%;
+}
+
+.user-chip[hidden] {
+    display: none;
+}
+
+.user-name {
+    max-width: 22vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.user-chip .access-btn {
+    color: var(--person);
+    font-weight: 600;
+    text-decoration: none;
+}
+
+.user-chip .access-btn:hover {
+    background: #e4e5f0;
+}
+
+/* ============================ 圆圈 i：所有帮助提示都收在这里 ============================ */
+/* 用法：<button class="hint" data-hint="说明文字" aria-label="……"></button>
+   说明纯用 CSS 气泡展示（hover / 键盘 focus 都会出现），不需要 JS 参与。 */
+.hint {
+    position: relative;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 19px;
+    height: 19px;
+    padding: 0;
+    /* 深色描边 + 白底 + 外圈白色光晕：在白色顶栏、浅色列头、彩色底上都能看清
+       （之前是白底 + #e5e7eb 细边，在白顶栏上对比度只有 1.03:1，等于隐形） */
+    border: 1px solid #6b7280;
+    border-radius: 50%;
+    background: var(--surface);
+    color: var(--text);
+    /* 圆圈里的 i 用衬线斜体，更像正式版式而不是图标字体 */
+    font-family: Georgia, "Times New Roman", "Songti SC", serif;
+    font-size: 12px;
+    font-style: italic;
+    font-weight: 600;
+    line-height: 1;
+    cursor: help;
+    box-shadow: 0 0 0 2px rgba(255, 255, 255, .85), 0 1px 2px rgba(28, 34, 40, .12);
+    transition: color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease),
+        background var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+
+/* display:inline-flex 会覆盖 [hidden]，必须显式声明 */
+.hint[hidden] {
+    display: none;
+}
+
+.hint::before {
+    content: "i";
+}
+
+.hint:hover,
+.hint:focus-visible {
+    outline: none;
+    color: #fff;
+    border-color: var(--accent-deep);
+    background: var(--accent-deep);
+}
+
+/* 提醒态（例如「你还在用初始密码」） */
+.hint.hint-warn {
+    color: var(--warn-ink);
+    border-color: var(--warn-ink);
+    background: var(--warn-bg);
+}
+
+.hint.hint-warn:hover,
+.hint.hint-warn:focus-visible {
+    color: #fff;
+    border-color: var(--warn-ink);
+    background: var(--warn-ink);
+}
+
+/* 气泡本体 */
+.hint::after {
+    content: attr(data-hint);
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 50%;
+    z-index: 300;
+    width: max-content;
+    max-width: min(300px, 78vw);
+    padding: 8px 11px;
+    border-radius: var(--radius-sm);
+    background: rgba(40, 45, 51, .96);
+    color: #f3f5f7;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 12px;
+    font-style: normal;
+    font-weight: 400;
+    line-height: 1.7;
+    text-align: left;
+    /* 说明里可以换行（例如访问地址那几条），换行按原样显示 */
+    white-space: pre-line;
+    box-shadow: var(--shadow-md);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translate(-50%, -4px);
+    transition: opacity var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
+}
+
+.hint:hover::after,
+.hint:focus::after,
+.hint:focus-visible::after {
+    opacity: 1;
+    visibility: visible;
+    transform: translate(-50%, 0);
+}
+
+/* 靠左的元素：气泡向左对齐，避免顶出屏幕 */
+.hint.hint-start::after {
+    left: 0;
+    transform: translate(0, -4px);
+}
+
+.hint.hint-start:hover::after,
+.hint.hint-start:focus-visible::after {
+    transform: none;
+}
+
+/* 靠右的元素：气泡向右对齐 */
+.hint.hint-end::after {
+    left: auto;
+    right: 0;
+    transform: translate(0, -4px);
+}
+
+.hint.hint-end:hover::after,
+.hint.hint-end:focus-visible::after {
+    transform: none;
+}
+
+/* ============================ 登录页 ============================ */
+.login-page {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    padding: 20px;
+    /* 极淡的 Tiffany 渐变，不做彩色背景 */
+    background:
+        radial-gradient(120% 90% at 20% 0%, rgba(10, 186, 181, .10) 0%, rgba(10, 186, 181, 0) 55%),
+        radial-gradient(120% 90% at 100% 100%, rgba(125, 129, 168, .10) 0%, rgba(125, 129, 168, 0) 55%),
+        var(--page-bg);
+}
+
+.login-card {
+    width: 100%;
+    max-width: 380px;
+    padding: 30px 28px 24px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    box-shadow: var(--shadow-lg);
+    animation: dialog-in .4s var(--ease) both;
+}
+
+.login-brand {
+    text-align: center;
+    margin-bottom: 20px;
+}
+
+.login-brand .logo {
+    width: 40px;
+    height: 40px;
+    margin: 0 auto;
+    border-radius: 12px;
+}
+
+.login-brand .logo::before,
+.login-brand .logo::after {
+    top: 11px;
+    bottom: 11px;
+    width: 4px;
+}
+
+.login-brand .logo::before {
+    left: 11px;
+}
+
+.login-brand .logo::after {
+    left: 24px;
+}
+
+.login-brand h1 {
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: .5px;
+    margin: 12px 0 4px;
+    color: var(--text);
+}
+
+.login-sub {
+    font-size: 13px;
+    color: var(--text-soft);
+}
+
+.login-card label {
+    display: block;
+    margin: 14px 0 5px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-soft);
+}
+
+.login-card input {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    font-size: 15px;
+    font-family: inherit;
+    background: var(--surface);
+    transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+
+.login-card input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: var(--focus-ring);
+}
+
+.login-submit {
+    width: 100%;
+    margin-top: 22px;
+    padding: 11px;
+    font-size: 15px;
+    letter-spacing: 2px;
+}
+
+.login-error {
+    padding: 9px 12px;
+    background: var(--danger-bg);
+    border: 1px solid #e8d3d4;
+    border-radius: var(--radius-sm);
+    color: var(--danger-ink);
+    font-size: 13px;
+}
+
+.login-foot {
+    margin-top: 16px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-mute);
+    word-break: break-all;
+}
+
+/* ============================ 局域网访问地址 ============================ */
+.access-info {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    max-width: 100%;
+    padding: 4px 8px 4px 12px;
+    background: var(--accent-soft);
+    border: 1px solid var(--accent-line);
+    border-radius: 999px;
+    font-size: 12px;
+    color: var(--accent-deep);
+}
+
+/* display:flex 会覆盖 [hidden]，必须显式声明 */
+.access-info[hidden] {
+    display: none;
+}
+
+/* 探测不到局域网地址 / 接口失败时的警示态 */
+.access-info.access-info-warn {
+    background: var(--warn-bg);
+    border-color: #e6dcc4;
+    color: var(--warn-ink);
+}
+
+.access-label {
+    white-space: nowrap;
+    opacity: .9;
+}
+
+.access-url {
+    color: var(--accent-deep);
+    font-weight: 600;
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 42vw;
+}
+
+.access-url:hover {
+    text-decoration: underline;
+}
+
+.access-info-warn .access-url {
+    color: var(--warn-ink);
+    text-decoration: none;
+    cursor: default;
+}
+
+.access-btn {
+    flex: none;
+    padding: 3px 7px;
+    border: none;
+    border-radius: 7px;
+    background: none;
+    color: inherit;
+    font-size: 12px;
+    font-family: inherit;
+    line-height: 1.4;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease);
+}
+
+.access-btn:hover {
+    background: rgba(10, 186, 181, .12);
+}
+
+.access-info-warn .access-btn:hover {
+    background: rgba(171, 143, 86, .14);
+}
+
+.search {
+    width: 210px;
+    padding: 8px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-family: inherit;
+    background: #f7f8f9;
+    transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease),
+        background var(--dur-fast) var(--ease);
+}
+
+.search:focus {
+    outline: none;
+    border-color: var(--accent);
+    background: var(--surface);
+    box-shadow: var(--focus-ring);
+}
+
+/* -------- 搜索下拉结果（像浏览器搜索那样浮在输入框下方） -------- */
+.search-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+}
+
+.search-results {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 200;             /* 高于顶栏（100），低于弹窗（1000） */
+    width: 380px;
+    max-width: calc(100vw - 32px);
+    max-height: 60vh;
+    overflow-y: auto;
+    padding: 6px;
+    background: rgba(255, 255, 255, .92);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    backdrop-filter: blur(20px) saturate(180%);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
+    transform-origin: top right;
+    animation: dropdown-in var(--dur) var(--ease) both;
+}
+
+/* 作者样式里有 display，必须显式覆盖 [hidden] */
+.search-results[hidden] {
+    display: none;
+}
+
+.search-item {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 7px 9px;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease);
+}
+
+.search-item:hover,
+.search-item.active {
+    background: var(--accent-soft);
+    box-shadow: inset 0 0 0 1px var(--accent-line);
+}
+
+.search-item .si-issue {
+    flex: none;
+    color: var(--text-mute);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+}
+
+.search-item .si-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.search-item .si-meta {
+    flex: none;
+    color: var(--text-mute);
+    font-size: 11px;
+}
+
+.search-item mark {
+    padding: 0 1px;
+    border-radius: 3px;
+    background: #f2e6c8;
+    color: var(--todo-ink);
+}
+
+.search-empty {
+    padding: 12px 10px;
+    color: var(--text-soft);
+    font-size: 13px;
+    text-align: center;
+}
+
+.search-foot {
+    margin-top: 4px;
+    padding: 6px 9px 4px;
+    border-top: 1px solid var(--line-soft);
+    color: var(--text-mute);
+    font-size: 11px;
+}
+
+/* 从搜索结果跳到卡片时闪一下，方便找到目标 */
+.card.card-flash {
+    animation: card-flash 1.8s var(--ease);
+}
+
+@keyframes card-flash {
+    0%,
+    100% {
+        box-shadow: var(--shadow-sm);
+    }
+    15%,
+    60% {
+        box-shadow: 0 0 0 3px rgba(10, 186, 181, .32), var(--shadow-md);
+    }
+}
+
+/* ============================ 按钮 ============================ */
+.btn {
+    padding: 8px 15px;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-size: 13px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease),
+        box-shadow var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease),
+        opacity var(--dur-fast) var(--ease);
+}
+
+/* 按下时轻微缩小，像 Apple 的按钮反馈（不做位移，避免抖动） */
+.btn:active {
+    transform: scale(.97);
+}
+
+.btn:disabled {
+    opacity: .5;
+    cursor: var(--cursor-no);
+}
+
+.btn-primary {
+    background: var(--accent-deep);
+    color: #fff;
+    box-shadow: 0 1px 2px rgba(13, 143, 139, .24);
+}
+
+.btn-primary:hover:not(:disabled) {
+    background: #0b7f7b;
+}
+
+.btn-secondary {
+    background: #eceef0;
+    color: var(--text);
+}
+
+.btn-secondary:hover:not(:disabled) {
+    background: #e2e5e8;
+}
+
+/* ---- 视图切换按钮组：状态视图 / 人员视图（Apple 分段控件） ---- */
+.view-switch {
+    display: inline-flex;
+    padding: 3px;
+    background: #ebedef;
+    border-radius: 12px;
+    gap: 2px;
+}
+
+.btn-view {
+    padding: 7px 13px;
+    border-radius: 9px;
+    background: transparent;
+    color: var(--text-soft);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.btn-view:hover {
+    color: var(--text);
+}
+
+.btn-view.active {
+    background: var(--surface);
+    color: var(--accent-deep);
+    box-shadow: 0 1px 2px rgba(28, 34, 40, .12), 0 0 0 1px rgba(28, 34, 40, .08);
+}
+
+.btn-view.active[data-view="status"] {
+    color: var(--accent-deep);
+}
+
+.icon-btn {
+    border: none;
+    background: transparent;
+    color: var(--text-soft);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    padding: 4px 6px;
+    border-radius: 7px;
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+
+.icon-btn:hover {
+    background: var(--line-soft);
+    color: var(--text);
+}
+
+.icon-btn.danger:hover {
+    background: var(--danger-bg);
+    color: var(--danger-ink);
+}
+
+.icon-btn:disabled {
+    opacity: .45;                 /* 禁用但仍看得见：太透会以为按钮消失了 */
+    cursor: var(--cursor-no);
+}
+
+/* ============================ 状态提示条 ============================ */
+.status-bar {
+    padding: 0 20px;
+    font-size: 13px;
+    min-height: 26px;
+    line-height: 26px;
+    color: var(--accent-deep);
+    transition: opacity var(--dur-fast) var(--ease);
+}
+
+.status-bar:empty {
+    min-height: 8px;
+}
+
+/* 有新提示时轻轻落下，不抢视线 */
+.status-bar:not(:empty) {
+    animation: toast-in var(--dur) var(--ease);
+}
+
+.status-bar.error {
+    color: var(--danger-ink);
+}
+
+.status-bar.success {
+    color: var(--done-ink);
+}
+
+.status-bar.loading {
+    color: var(--text-soft);
+}
+
+/* ============================ 看板布局 ============================ */
+.board {
+    flex: 1;
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    padding: 8px 20px 20px;
+    overflow-x: auto;
+}
+
+.column {
+    flex: 1 1 0;
+    min-width: 280px;
+    background: var(--column-bg);
+    border: 1px solid rgba(28, 34, 40, .04);
+    border-radius: var(--radius);
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 190px);
+    transition: background var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+
+/* 人员视图列更多，适当收窄以便一屏能看到更多人 */
+.board[data-view="assignee"] .column {
+    min-width: 232px;
+}
+
+/* 拖拽悬停时整列高亮 */
+.column.drop-active {
+    background: var(--accent-soft);
+    box-shadow: inset 0 0 0 2px rgba(10, 186, 181, .45);
+}
+
+.board[data-view="assignee"] .column.drop-active {
+    background: var(--person-bg);
+    box-shadow: inset 0 0 0 2px rgba(125, 129, 168, .45);
+}
+
+.column-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+    border-radius: var(--radius-sm);
+}
+
+/* 列头左边的小圆点：状态色 / 人员色，代替原来的 emoji */
+.column-head::before {
+    content: "";
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: .75;
+}
+
+.column-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* 状态视图列头配色（低饱和底 + 深一度的文字） */
+.col-todo .column-head {
+    background: var(--todo-bg);
+    color: var(--todo-ink);
+}
+
+.col-doing .column-head {
+    background: var(--doing-bg);
+    color: var(--doing-ink);
+}
+
+.col-done .column-head {
+    background: var(--done-bg);
+    color: var(--done-ink);
+}
+
+/* 人员视图列头配色（低饱和紫灰系，--hue 由 JS 按人注入，因此每人颜色不同） */
+.col-person .column-head {
+    background: hsl(var(--hue, 265) 26% 94%);
+    color: hsl(var(--hue, 265) 24% 38%);
+}
+
+.col-person.col-unassigned .column-head {
+    background: #ebedef;
+    color: #5c636b;
+}
+
+/* 人员视图下卡片左侧色条跟随列色相，便于区分 */
+.board[data-view="assignee"] .card {
+    border-left-color: hsl(var(--hue, 265) 26% 74%);
+}
+
+/* ---- 别人的任务：置灰、不可拖拽 ---- */
+.card.card-locked {
+    background: #f6f7f8;
+    cursor: var(--cursor-no);
+    opacity: .7;
+}
+
+.card.card-locked:hover {
+    box-shadow: var(--shadow-sm);
+    transform: none;
+}
+
+.card.card-locked .card-title {
+    color: var(--text-soft);
+}
+
+.card.card-locked:active {
+    cursor: var(--cursor-no);
+}
+
+/* ---- 已完成的任务：终态，连拖都拖不起来 ---- */
+.card.card-final {
+    cursor: default;
+}
+
+.card.card-final:active {
+    cursor: default;
+}
+
+/* 只读的负责人徽章 */
+.assignee-badge-readonly {
+    cursor: var(--cursor-no);
+}
+
+.assignee-badge-readonly:hover {
+    border-color: transparent;
+    background: inherit;
+}
+
+/* ---- Done 列：不接受手动拖入（斜纹提示；说明文字收进列头的圆圈 i） ---- */
+.column.col-locked .column-head {
+    background: repeating-linear-gradient(45deg, var(--done-bg), var(--done-bg) 8px, #e2ece6 8px, #e2ece6 16px);
+}
+
+.column.col-locked .card-list {
+    background: repeating-linear-gradient(45deg, rgba(255, 255, 255, .4), rgba(255, 255, 255, .4) 8px, transparent 8px, transparent 16px);
+    border-radius: var(--radius-sm);
+}
+
+/* 列头的圆圈 i 排在数量徽章前面 */
+.column-head .hint {
+    order: 1;
+}
+
+/* 数量徽章排在最后 */
+.column-head .count {
+    order: 2;
+}
+
+.count {
+    flex: none;
+    background: rgba(255, 255, 255, .85);
+    border: 1px solid rgba(28, 34, 40, .10);
+    border-radius: 999px;
+    padding: 0 8px;
+    font-size: 11px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.card-list {
+    flex: 1;
+    min-height: 80px;
+    overflow-y: auto;
+    padding: 2px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.add-inline {
+    margin-top: 8px;
+    padding: 8px;
+    border: 1px dashed #c9ced4;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-soft);
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease),
+        border-color var(--dur-fast) var(--ease);
+}
+
+.add-inline:hover {
+    background: var(--surface);
+    color: var(--accent-deep);
+    border-color: var(--accent-line);
+}
+
+.board[data-view="assignee"] .add-inline:hover {
+    color: var(--person);
+    border-color: var(--person-line);
+}
+
+/* ============================ 任务卡片 ============================ */
+.card {
+    background: var(--surface);
+    border: 1px solid rgba(28, 34, 40, .05);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    box-shadow: var(--shadow-sm);
+    border-left: 3px solid transparent;
+    cursor: var(--cursor-move);
+    transition: box-shadow var(--dur) var(--ease), transform var(--dur) var(--ease),
+        opacity var(--dur-fast) var(--ease);
+    will-change: transform, box-shadow;
+}
+
+/* 悬停轻微上浮 —— 幅度小、时间短，不动声色 */
+.card:hover {
+    box-shadow: var(--shadow-md);
+    transform: translateY(-1px);
+}
+
+.card:active {
+    cursor: var(--cursor-move-active);
+}
+
+.card.dragging {
+    opacity: .5;
+    transform: rotate(1deg);
+    box-shadow: var(--shadow-lg);
+}
+
+/* 左侧色条与状态一致 */
+.card.status-todo {
+    border-left-color: var(--todo);
+}
+
+.card.status-doing {
+    border-left-color: var(--doing);
+}
+
+.card.status-done {
+    border-left-color: var(--done);
+}
+
+.card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.card-tags {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.issue-num {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-mute);
+    font-variant-numeric: tabular-nums;
+    flex: none;
+}
+
+.issue-num:hover {
+    color: var(--accent-deep);
+}
+
+.badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 8px;
+    border-radius: 999px;
+    white-space: nowrap;
+}
+
+.badge-todo {
+    background: var(--todo-bg);
+    color: var(--todo-ink);
+}
+
+.badge-doing {
+    background: var(--doing-bg);
+    color: var(--doing-ink);
+}
+
+.badge-done {
+    background: var(--done-bg);
+    color: var(--done-ink);
+}
+
+/* ---- 负责人徽章：点击即可切换负责人 ---- */
+.assignee-badge {
+    border: 1px solid transparent;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 8px;
+    border-radius: 999px;
+    white-space: nowrap;
+    cursor: pointer;
+    max-width: 132px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease),
+        color var(--dur-fast) var(--ease);
+}
+
+.assignee-badge-named {
+    background: var(--person-bg);
+    color: var(--person);
+}
+
+.assignee-badge-named:hover {
+    background: #e5e6f0;
+    border-color: var(--person-line);
+}
+
+.assignee-badge-empty {
+    background: #f1f2f4;
+    color: var(--text-soft);
+    border-color: rgba(28, 34, 40, .10);
+}
+
+.assignee-badge-empty:hover {
+    background: #e8eaec;
+    border-color: #d3d7db;
+}
+
+.card-title {
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.4;
+    margin-bottom: 4px;
+    word-break: break-word;
+}
+
+.card-desc {
+    font-size: 12px;
+    color: var(--text-soft);
+    white-space: pre-wrap;
+    word-break: break-word;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+
+.card-desc:empty {
+    display: none;
+}
+
+/* ============================ Agent 审核结果 ============================ */
+.card-review {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+/* display:flex 会覆盖 [hidden]，必须显式声明 */
+.card-review[hidden] {
+    display: none;
+}
+
+.review-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    padding: 2px 10px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.7;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: background var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+
+/* 徽章前的状态圆点：通过/不通过/未完成靠颜色区分，不用 emoji */
+.review-badge::before {
+    content: "";
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+/* 通过 = 灰绿 */
+.review-badge.pass {
+    background: var(--done-bg);
+    color: var(--done-ink);
+    border-color: #d8e6dd;
+}
+
+/* 不通过 = 暗红 */
+.review-badge.fail {
+    background: var(--danger-bg);
+    color: var(--danger-ink);
+    border-color: #e8d3d4;
+}
+
+/* 审核没跑成 = 中性黄（既不通过也不失败） */
+.review-badge.unknown {
+    background: var(--warn-bg);
+    color: var(--warn-ink);
+    border-color: #e6dcc4;
+}
+
+/* 有评语时可点击展开 */
+.review-badge.review-badge-toggle {
+    cursor: pointer;
+}
+
+.review-badge.review-badge-toggle:hover {
+    box-shadow: 0 1px 4px rgba(28, 34, 40, .12);
+}
+
+/* 只有结论、没有评语时不可点击 */
+.review-badge.review-badge-static {
+    cursor: default;
+}
+
+.review-comment {
+    width: 100%;
+    max-height: 190px;
+    overflow-y: auto;
+    padding: 8px 10px;
+    background: #f7f8f9;
+    border-left: 3px solid var(--accent-line);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    line-height: 1.7;
+    color: #52585f;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.review-comment[hidden] {
+    display: none;
+}
+
+/* 人员视图下让评语的左侧色条跟随列色相，保持视觉一致 */
+.board[data-view="assignee"] .review-comment {
+    border-left-color: hsl(var(--hue, 265) 26% 76%);
+}
+
+/* 分支 / 提交信息 */
+.card-meta {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+/* display:flex 会覆盖 [hidden] 的默认样式，这里显式声明 */
+.card-meta[hidden] {
+    display: none;
+}
+
+.branch-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    align-self: flex-start;
+    max-width: 100%;
+    font-size: 11px;
+    background: #f1f2f4;
+    color: #4b5158;
+    border-radius: 6px;
+    padding: 2px 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.commit {
+    display: flex;
+    gap: 6px;
+    align-items: baseline;
+    font-size: 11px;
+    color: var(--text-soft);
+    min-width: 0;
+}
+
+.commit code {
+    flex: none;
+    background: #f1f2f4;
+    color: #4b5158;
+}
+
+.commit .commit-msg {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.card-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid var(--line-soft);
+    min-height: 26px;
+}
+
+.card-time {
+    font-size: 11px;
+    color: var(--text-mute);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.card-actions {
+    display: flex;
+    gap: 2px;
+    opacity: .55;
+    transition: opacity var(--dur-fast) var(--ease);
+}
+
+.card:hover .card-actions,
+.card:focus-within .card-actions {
+    opacity: 1;
+}
+
+/* ============================ 空状态 / 页脚 ============================ */
+.empty-hint {
+    margin: 4px 20px 16px;
+    padding: 14px 18px;
+    background: var(--surface);
+    border: 1px dashed var(--line);
+    border-radius: var(--radius);
+    color: var(--text-soft);
+    font-size: 13px;
+    text-align: center;
+}
+
+.footer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 12px 20px 20px;
+    font-size: 12px;
+    color: var(--text-mute);
+}
+
+.footer .dot {
+    color: #d5d8dc;
+}
+
+/* 「已从看板移除 N 条 · 全部恢复」这种行内链接按钮 */
+.link-btn {
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--accent-deep);
+    font-size: inherit;
+    font-family: inherit;
+    cursor: pointer;
+}
+
+.link-btn:hover {
+    text-decoration: underline;
+}
+
+.link-btn b {
+    font-variant-numeric: tabular-nums;
+}
+
+/* ---- 实时通道状态（页脚）：一个小圆点 + 在线名单 ---- */
+.realtime-info {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+/* display:inline-flex 会覆盖 [hidden]，必须显式声明 */
+.realtime-info[hidden] {
+    display: none;
+}
+
+.realtime-dot {
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--doing);
+    box-shadow: 0 0 0 3px rgba(79, 168, 163, .16);
+}
+
+/* 连上时轻轻呼吸一下，表示通道是活的（幅度很小，不抢视线） */
+.realtime-info:not(.realtime-off) .realtime-dot {
+    animation: realtime-pulse 2.6s var(--ease) infinite;
+}
+
+.realtime-info.realtime-off {
+    color: var(--warn-ink);
+}
+
+.realtime-info.realtime-off .realtime-dot {
+    background: var(--warn);
+    box-shadow: 0 0 0 3px rgba(171, 143, 86, .16);
+}
+
+@keyframes realtime-pulse {
+    0%,
+    100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: .45;
+    }
+}
+
+/* ============================ 弹窗（Apple 风格） ============================ */
+.modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+}
+
+.modal.active {
+    display: flex;
+}
+
+/* 遮罩：压暗 + 毛玻璃模糊，让背后的看板「虚化后退」 */
+.modal-mask {
+    position: absolute;
+    inset: 0;
+    background: rgba(28, 32, 38, .26);
+    -webkit-backdrop-filter: blur(12px) saturate(140%);
+    backdrop-filter: blur(12px) saturate(140%);
+    animation: mask-in var(--dur) var(--ease) both;
+}
+
+.modal-content {
+    position: relative;
+    width: 100%;
+    max-width: 440px;
+    max-height: 90vh;
+    overflow-y: auto;
+    background: var(--surface);
+    border-radius: 20px;
+    padding: 24px 24px 20px;
+    box-shadow: var(--shadow-lg);
+    animation: dialog-in .34s var(--ease) both;
+}
+
+/* 关闭时反向淡出（由 JS 加 .closing，动画结束后再真正移除 .active） */
+.modal.closing .modal-content {
+    animation: dialog-out .18s ease-in both;
+}
+
+.modal.closing .modal-mask {
+    animation: mask-out .18s ease-in both;
+}
+
+/* 弹窗标题行：标题 + 圆圈 i（说明都收在 i 里） */
+.modal-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.modal-head h3 {
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: .2px;
+}
+
+.modal-content label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-soft);
+    margin: 14px 0 5px;
+}
+
+.required {
+    color: var(--danger);
+}
+
+.modal-content input,
+.modal-content textarea,
+.modal-content select {
+    width: 100%;
+    padding: 9px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    font-size: 14px;
+    font-family: inherit;
+    color: var(--text);
+    background: var(--surface);
+    transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+
+.modal-content input:focus,
+.modal-content textarea:focus,
+.modal-content select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: var(--focus-ring);
+}
+
+.modal-content textarea {
+    resize: vertical;
+    min-height: 84px;
+}
+
+/* 状态 + 负责人并排 */
+.field-row {
+    display: flex;
+    gap: 12px;
+}
+
+.field-row .field {
+    flex: 1;
+    min-width: 0;
+}
+
+.field-row .field label {
+    margin-top: 14px;
+}
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 20px;
+}
+
+/* Apple 弹窗常用「取消在左、主操作在右」，且按钮等宽偏扁平 */
+.modal-actions .btn {
+    min-width: 84px;
+    padding: 9px 16px;
+    border-radius: 12px;
+}
+
+@keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes toast-in {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: none; }
+}
+
+/* 对话框：从略小略下淡入放大，带一点「落位」感 */
+@keyframes dialog-in {
+    from { opacity: 0; transform: scale(.94) translateY(10px); }
+    to { opacity: 1; transform: none; }
+}
+
+@keyframes dialog-out {
+    from { opacity: 1; transform: none; }
+    to { opacity: 0; transform: scale(.97) translateY(4px); }
+}
+
+@keyframes mask-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+@keyframes mask-out {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+/* 下拉面板：从右上角原地展开 */
+@keyframes dropdown-in {
+    from { opacity: 0; transform: scale(.97) translateY(-4px); }
+    to { opacity: 1; transform: none; }
+}
+
+@keyframes pop-in {
+    from { opacity: 0; transform: translateY(-8px) scale(.98); }
+    to { opacity: 1; transform: none; }
+}
+
+/* ============================ 无障碍：尊重「减弱动态效果」 ============================ */
+/* 系统里开了「减弱动态效果」时，只保留必要的状态变化，不做位移与缩放动画 */
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: .001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .001ms !important;
+    }
+
+    .card:hover {
+        transform: none;
+    }
+
+    .btn:active {
+        transform: none;
+    }
+}
+
+/* ============================ 响应式 ============================ */
+@media (max-width: 1024px) {
+    .search {
+        width: 160px;
+    }
+}
+
+@media (max-width: 768px) {
+    .topbar {
+        padding: 10px 14px;
+    }
+
+    .brand-text h1 {
+        font-size: 16px;
+    }
+
+    .toolbar {
+        width: 100%;
+    }
+
+    .view-switch {
+        flex: 1 1 auto;
+        justify-content: space-between;
+    }
+
+    .btn-view {
+        flex: 1;
+        text-align: center;
+    }
+
+    .search-wrap {
+        flex: 1 1 140px;
+        min-width: 0;
+    }
+
+    .search {
+        width: 100%;
+        min-width: 0;
+    }
+
+    .board {
+        flex-direction: column;
+        padding: 8px 14px 16px;
+        overflow-x: visible;
+    }
+
+    .column,
+    .board[data-view="assignee"] .column {
+        width: 100%;
+        min-width: 0;
+        max-height: none;
+    }
+
+    .card-list {
+        overflow-y: visible;
+    }
+
+    /* 手机端不依赖拖拽，改用卡片上的 ← → 按钮 */
+    .card {
+        cursor: default;
+    }
+
+    .card-actions {
+        opacity: 1;
+    }
+
+    .field-row {
+        flex-direction: column;
+        gap: 0;
+    }
+
+    .empty-hint,
+    .status-bar,
+    .footer {
+        padding-left: 14px;
+        padding-right: 14px;
+    }
+
+    .status-bar,
+    .footer,
+    .empty-hint {
+        margin-left: 0;
+        margin-right: 0;
+    }
+
+    /* 手机上把访问地址放到控件下方独占一行，方便盯着输入 */
+    .access-info {
+        order: 3;
+        width: 100%;
+        justify-content: center;
+    }
+
+    .access-url {
+        max-width: 55vw;
+    }
+}
+
+/* 打印时隐藏交互元素 */
+@media print {
+    .toolbar,
+    .access-info,
+    .add-inline,
+    .card-actions,
+    .hint,
+    .footer {
+        display: none;
+    }
+}

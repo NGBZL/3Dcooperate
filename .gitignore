@@ -1,0 +1,35 @@
+# ---------- 敏感配置 ----------
+.env
+# Agent 的 LLM Key（`.env` 规则本已覆盖，这里显式写出更醒目）
+agent/.env
+
+# 负责人真名映射表：GitHub 上只用代号，真名只留在本地，绝不能提交
+assignees.local.json
+
+# Flask 会话密钥：泄露了别人就能伪造登录态，绝不能提交
+secret.key
+
+# ---------- 本地数据 ----------
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# ---------- 前端自检用的 jsdom（可选，见 tools/test_ui.js） ----------
+node_modules/
+package-lock.json
+package.json
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

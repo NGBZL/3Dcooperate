@@ -175,8 +175,17 @@ def main(argv: list[str] | None = None) -> int:
     if code == 0 and staged_diff.strip():
         say("检查暂存区改动")
         problems.extend(scan_text(staged_diff, names, "暂存区"))
+        # 从 diff 头里取**精确**的目标路径再比对：
+        # 直接用 f"b/{path}" 子串匹配会把 ".env.example" 误判成 ".env"
+        staged_paths: set[str] = set()
+        for line in staged_diff.splitlines():
+            if not line.startswith("diff --git "):
+                continue
+            parts = line.split()
+            if len(parts) >= 4:
+                staged_paths.add(parts[3][2:] if parts[3].startswith("b/") else parts[3])
         for path in SENSITIVE_PATTERNS:
-            if f"b/{path}" in staged_diff:
+            if path in staged_paths:
                 problems.append(f"敏感文件被加入暂存区：{path}")
 
     # ---------- 4. 提交信息 ----------

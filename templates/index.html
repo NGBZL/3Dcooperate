@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>项目看板 · GitHub Issues</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<!-- ===================== 顶部工具栏 ===================== -->
+<header class="topbar">
+    <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <div class="brand-text">
+            <h1>项目看板</h1>
+            <span class="repo-name" id="repo-name">GitHub Issues 驱动</span>
+        </div>
+    </div>
+
+    <!-- 局域网访问地址：打开页面自动显示，方便把地址直接发给组员 -->
+    <div class="access-info" id="access-info" hidden>
+        <span class="access-label">组员访问</span>
+        <a id="access-url" class="access-url" target="_blank" rel="noopener noreferrer"></a>
+        <button id="btn-copy-url" class="access-btn" type="button" title="复制访问地址">复制</button>
+        <button id="btn-access-help" class="hint" type="button" aria-label="组员打不开怎么办"></button>
+    </div>
+
+    <!-- 当前登录用户 -->
+    <div class="user-chip" id="user-chip" hidden>
+        <span class="user-name" id="user-name"></span>
+        <button id="default-pwd-hint" class="hint hint-end hint-warn" type="button"
+                aria-label="密码提醒" hidden></button>
+        <button id="btn-change-password" class="access-btn" type="button" title="修改自己的登录密码">修改密码</button>
+        <a id="btn-logout" class="access-btn" href="/logout" title="退出登录">登出</a>
+    </div>
+
+    <div class="toolbar">
+        <!-- 视图切换：状态视图（三列）/ 人员视图（6 人 + 未分配） -->
+        <div class="view-switch" role="group" aria-label="视图切换">
+            <button id="view-status" class="btn btn-view active" data-view="status" type="button">状态视图</button>
+            <button id="view-assignee" class="btn btn-view" data-view="assignee" type="button">人员视图</button>
+        </div>
+        <!-- 视图用法说明（拖拽语义等）都收在这个圆圈 i 里 -->
+        <button id="view-help" class="hint" type="button" aria-label="视图用法说明"
+                data-hint="状态视图：拖到某列即改状态（Todo / Doing / Done）；人员视图：拖到某人列即改负责人（6 人 + 未分配）。别人的任务不能动；未分配的卡片，谁把它拖走就等于认领给自己，认领之后只有本人能继续动。"></button>
+        <div class="search-wrap">
+            <input type="search" id="search-input" class="search"
+                   placeholder="搜索标题 / 负责人 / 编号…" autocomplete="off"
+                   role="combobox" aria-expanded="false" aria-controls="search-results">
+            <!-- 搜索用法与快捷键提示收在这个圆圈 i 里 -->
+            <button id="search-help" class="hint hint-end" type="button" aria-label="搜索用法"
+                    data-hint="输入即在下方弹出匹配结果（标题 / 描述 / 编号 / 负责人 / AI 评语），看板不会被过滤；↑ ↓ 选择，Enter 跳转，Esc 关闭。"></button>
+            <!-- 匹配结果下拉面板（由 app.js 填充） -->
+            <div class="search-results" id="search-results" role="listbox" hidden></div>
+        </div>
+        <button id="btn-new" class="btn btn-primary" type="button">新建任务</button>
+        <button id="btn-sync" class="btn btn-secondary" type="button">同步</button>
+    </div>
+</header>
+
+<!-- ===================== 状态提示条 ===================== -->
+<div class="status-bar" id="status-bar" role="status" aria-live="polite"></div>
+
+<!-- ===================== 看板主体（列由 app.js 按当前视图动态渲染） ===================== -->
+<main class="board" id="board" data-view="status"></main>
+
+<!-- 空状态提示 -->
+<div class="empty-hint" id="empty-hint" hidden>
+    还没有任何任务，点击「同步」从 GitHub 拉取 Issues，或点击「新建任务」创建第一个任务。
+</div>
+
+<footer class="footer">
+    <span>数据源：GitHub Issues</span>
+    <span class="dot">·</span>
+    <span id="view-hint">当前视图：状态</span>
+    <span class="dot">·</span>
+    <a href="#" id="health-link">服务状态</a>
+    <span class="dot">·</span>
+    <!-- 已从看板移除的任务：显示数量 + 一键恢复 -->
+    <span id="hidden-info" hidden>
+        <button id="btn-restore-all" class="link-btn" type="button">已从看板移除 <b id="hidden-count">0</b> 条 · 全部恢复</button>
+        <span class="dot">·</span>
+    </span>
+    <!-- 实时通道（WebSocket）状态：连上时显示在线人数与姓名 -->
+    <span id="realtime-info" class="realtime-info" hidden>
+        <span class="realtime-dot" id="realtime-dot" aria-hidden="true"></span>
+        <span id="realtime-text"></span>
+    </span>
+    <span class="dot" id="realtime-sep" hidden>·</span>
+    <span id="last-update">尚未加载</span>
+</footer>
+
+<!-- ===================== 新建任务弹窗 ===================== -->
+<div class="modal" id="modal" aria-hidden="true">
+    <div class="modal-mask" data-close="1"></div>
+    <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <div class="modal-head">
+            <h3 id="modal-title">新建任务</h3>
+            <!-- 新建任务的说明（会建 Issue、正文写法、为什么不能选完成）都收在这个圆圈 i 里 -->
+            <button class="hint hint-start" id="modal-help" type="button" aria-label="新建任务说明"
+                    data-hint="创建后会在 GitHub 仓库生成对应的 Issue，自动打上状态标签，并把「负责人: 姓名」写进正文第一行。负责人默认是你自己；新建时不能直接选「完成」——完成只能由 Agent 审核通过后自动写入。"></button>
+        </div>
+
+        <label for="input-title">标题 <span class="required">*</span></label>
+        <input type="text" id="input-title" maxlength="200" placeholder="例如：完成点云配准模块">
+
+        <label for="input-desc">描述</label>
+        <textarea id="input-desc" rows="4" placeholder="补充背景、验收标准等（可选，会写入 Issue 正文）"></textarea>
+
+        <div class="field-row">
+            <div class="field">
+                <label for="input-status">初始状态</label>
+                <select id="input-status">
+                    <option value="todo">Todo</option>
+                    <option value="doing">Doing</option>
+                </select>
+            </div>
+
+            <div class="field">
+                <label for="input-assignee">负责人</label>
+                <select id="input-assignee">
+                    <!-- 选项由 app.js 依据后端 /api/assignees 填充，默认选中自己 -->
+                </select>
+            </div>
+        </div>
+
+        <div class="modal-actions">
+            <button class="btn btn-secondary" id="btn-cancel" type="button">取消</button>
+            <button class="btn btn-primary" id="btn-confirm" type="button">创建</button>
+        </div>
+    </div>
+</div>
+
+<!-- ===================== 修改密码弹窗 ===================== -->
+<div class="modal" id="pwd-modal" aria-hidden="true">
+    <div class="modal-mask" data-close-pwd="1"></div>
+    <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="pwd-title">
+        <div class="modal-head">
+            <h3 id="pwd-title">修改密码</h3>
+            <!-- 密码存放方式的说明收在这个圆圈 i 里 -->
+            <button class="hint hint-start" id="pwd-help" type="button" aria-label="密码说明"
+                    data-hint="密码只保存在本机数据库里，而且存的是加盐哈希值，看板不会把明文写到任何地方；建议不要和其他网站用同一个密码，忘了可以让管理员用 python auth.py reset 重置。"></button>
+        </div>
+
+        <label for="input-old-pwd">原密码</label>
+        <input type="password" id="input-old-pwd" autocomplete="current-password">
+
+        <label for="input-new-pwd">新密码</label>
+        <input type="password" id="input-new-pwd" autocomplete="new-password">
+
+        <label for="input-new-pwd2">重复新密码</label>
+        <input type="password" id="input-new-pwd2" autocomplete="new-password">
+
+        <div class="modal-actions">
+            <button class="btn btn-secondary" id="btn-pwd-cancel" type="button">取消</button>
+            <button class="btn btn-primary" id="btn-pwd-confirm" type="button">保存</button>
+        </div>
+    </div>
+</div>
+
+<!-- ===================== 模板 ===================== -->
+
+<!-- 看板列模板：状态视图与人员视图共用 -->
+<template id="column-template">
+    <section class="column">
+        <h2 class="column-head">
+            <span class="column-title"></span>
+            <!-- 列说明（例如 Done 列的写入规则）收在这个圆圈 i 里，由 app.js 按需填充 -->
+            <button class="hint hint-end column-help" type="button" aria-label="这一列的说明" hidden></button>
+            <span class="count">0</span>
+        </h2>
+        <div class="card-list"></div>
+        <button class="add-inline" type="button">添加任务</button>
+    </section>
+</template>
+
+<!-- 卡片模板（由 JS 克隆后填充数据，避免手写 innerHTML 带来的 XSS 风险） -->
+<template id="card-template">
+    <article class="card" draggable="true">
+        <div class="card-head">
+            <a class="issue-num" target="_blank" rel="noopener noreferrer"></a>
+            <div class="card-tags">
+                <span class="badge"></span>
+                <button class="assignee-badge" type="button" title="点击切换负责人">未分配</button>
+            </div>
+        </div>
+        <h3 class="card-title"></h3>
+        <p class="card-desc"></p>
+        <!-- Agent 审核结果：徽章 + 可展开的 AI 评语（没有审核结果时整体隐藏） -->
+        <div class="card-review" hidden>
+            <button class="review-badge" type="button" aria-expanded="false"></button>
+            <div class="review-comment" hidden></div>
+        </div>
+        <div class="card-meta" hidden></div>
+        <div class="card-footer">
+            <span class="card-time"></span>
+            <div class="card-actions">
+                <button class="icon-btn move-left" type="button" title="移到上一列">←</button>
+                <button class="icon-btn move-right" type="button" title="移到下一列">→</button>
+                <button class="icon-btn danger delete-btn" type="button" title="从看板移除（可恢复）">×</button>
+            </div>
+        </div>
+    </article>
+</template>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
