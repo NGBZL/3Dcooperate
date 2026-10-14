@@ -36,6 +36,7 @@ from __future__ import annotations
 import logging
 import re
 import socket
+import sys
 from typing import Any, Optional
 
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
@@ -75,6 +76,7 @@ from config import (
     SYNC_MAX_PAGES,
     SYNC_REVIEW_BUDGET,
     UNASSIGNED_LABEL,
+    USE_RELOADER,
     assignee_aliases,
     assignee_code,
     assignee_display,
@@ -1962,5 +1964,16 @@ if __name__ == "__main__":
 
     logger.info("=" * 56)
 
+    # 自动重载虽然方便，但「删一堆文件 / 改一批代码」时容易连着重启好几次，
+    # 重启过程中如果子进程被打断，整个服务就一起没了（日志里连报错都没有）。
+    # 所以：跑给团队用的那个实例建议用 --no-reload（或 .env 里 USE_RELOADER=0），
+    # 改完代码手动重启一次最稳。
+    no_reload = "--no-reload" in sys.argv or not USE_RELOADER
+    if no_reload:
+        logger.info("自动重载：已关闭（改代码后请手动重启；想开着就不加 --no-reload，"
+                    "并把 .env 里的 USE_RELOADER 设为 1）")
+    else:
+        logger.info("自动重载：已开启（改 .py 会自动重启）")
+
     # threaded=True：每个 WebSocket 连接要占一个线程，必须开多线程
-    app.run(host=HOST, port=PORT, debug=DEBUG, use_reloader=DEBUG, threaded=True)
+    app.run(host=HOST, port=PORT, debug=DEBUG, use_reloader=not no_reload, threaded=True)

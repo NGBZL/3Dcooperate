@@ -216,6 +216,12 @@ PR_MERGE_METHOD: str = _env("PR_MERGE_METHOD", "squash").lower()
 # 单次同步最多刷新多少个 PR 的状态（保护 API 额度）
 PR_SYNC_BUDGET: int = _env_int("PR_SYNC_BUDGET", 25)
 
+# 是否开启 werkzeug 的自动重载（改 .py 自动重启）。
+# 开发时方便；但「长期跑给团队用」建议关闭：
+# 批量改文件时它会连着重启好几次，重启过程中被打断整个服务就没了。
+# 命令行也可以临时关掉：python server.py --no-reload
+USE_RELOADER: bool = _env_bool("USE_RELOADER", True)
+
 # 提 PR 时自动写进正文的模板（{issue} 会替换成编号）
 # Closes #N 让 GitHub 在合并时自动关闭 Issue —— 这正是「合并后才进 Done」的机制
 PR_BODY_TEMPLATE: str = _env("PR_BODY_TEMPLATE", "关联任务 #{issue}\n\nCloses #{issue}\n")
