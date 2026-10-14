@@ -47,7 +47,8 @@ def run_git(*args: str, binary: bool = False) -> Any:
     :return: 命令输出
     :raises RuntimeError: git 返回非 0
     """
-    proc = subprocess.run(["git", *args], capture_output=True, timeout=120)
+    proc = subprocess.run(["git", "-c", "core.quotePath=false", *args],
+                          capture_output=True, timeout=120)
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip()[:200]
         raise RuntimeError(f"git {' '.join(args)} 失败：{detail}")
@@ -162,8 +163,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"⚠️  远端 {remote_sha[:8]} 不是本地父提交 {parent_sha[:8]}："
               f"说明远端有本地没有的提交，推完会覆盖它（脚本用 force 更新 ref）")
 
-    changed = [line for line in run_git("diff", "--name-only", parent_sha or "HEAD", local_sha).splitlines()
-               if line.strip()] if parent_sha else []
+    changed_raw = run_git("diff", "--name-only", "-z", parent_sha or "HEAD", local_sha) if parent_sha else ""
+    # -z + core.quotePath=false：中文文件名 / 特殊字符不会被 git 转义成 \345\220\257 这种
+    changed = [item for item in changed_raw.split("\0") if item.strip()]
     print(f"改动   ：{len(changed)} 个文件 {changed if changed else ''}")
     if args.dry_run:
         print("（--dry-run：到此为止，什么都没写）")
@@ -173,7 +175,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     for path in changed:
         # 内容取自 HEAD 的 blob（不是工作区文件）：避免 CRLF 之类的差异混进来
         content = run_git("cat-file", "blob", f"{local_sha}:{path}", binary=True)
-        mode = run_git("ls-tree", local_sha, path).split()[0]
+        mode = run_git("ls-tree", "-z", local_sha, path).split()[0]
         blob = call("POST", f"/repos/{repo}/git/blobs", json={
             "content": base64.b64encode(content).decode("ascii"), "encoding": "base64",
         })
