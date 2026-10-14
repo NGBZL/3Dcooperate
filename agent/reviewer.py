@@ -26,6 +26,7 @@ from .llm_client import LLMClient, LLMError
 from .prompt import (
     FAILED_FOOTER,
     PASSED_FOOTER,
+    PASSED_PR_FOOTER,
     REPORT_TEMPLATE,
     SYSTEM_PROMPT,
     build_user_prompt,
@@ -493,6 +494,32 @@ class CodeReviewer:
         """
         return self._request("GET", f"/repos/{self.repo}/issues/{issue_number}").json()
 
+    def _split_pr_numbers(self, numbers: list[int]) -> tuple[list[int], list[int]]:
+        """
+        把编号分成「真 Issue」和「其实是 Pull Request」两组。
+
+        GitHub 的 Issue 与 PR 共用编号空间，squash 合并提交里的 ``(#12)`` 是 PR 编号。
+        PR 不该被当成任务来定案（也不该去写它的评论/标签）。
+
+        :param numbers: 从提交信息里提取到的编号
+        :return: (真 Issue 列表, PR 列表)
+        """
+        real: list[int] = []
+        pull_requests: list[int] = []
+        for number in numbers:
+            try:
+                issue = self.get_issue(number)
+            except ReviewError as exc:
+                # 取不到就按 Issue 交下去，让后面的错误处理给出明确提示
+                logger.warning("判断 #%s 是否为 PR 时取不到信息：%s", number, exc.message)
+                real.append(number)
+                continue
+            if "pull_request" in issue:
+                pull_requests.append(number)
+            else:
+                real.append(number)
+        return real, pull_requests
+
     def _build_issue_info(self, issue_numbers: list[int]) -> str:
         """
         汇总关联 Issue 的信息，供提示词使用。
@@ -674,6 +701,7 @@ class CodeReviewer:
         commit_title: str,
         commit_sha: str,
         stats: dict[str, Any],
+        allow_close: bool = True,
     ) -> str:
         """
         生成写回 Issue 的 Markdown 审核报告。
@@ -683,6 +711,7 @@ class CodeReviewer:
         :param commit_title: 提交信息首行
         :param commit_sha: 提交 SHA
         :param stats: diff 统计
+        :param allow_close: False（PR 场景）时，结尾说明「等合并后再标记完成」
         :return: Markdown 文本
         """
         passed = bool(result.get("passed"))
@@ -717,7 +746,9 @@ class CodeReviewer:
             commit_title=commit_title or "",
             comment=comment,
             suggestions_section=suggestions_section,
-            action_footer=PASSED_FOOTER if passed else FAILED_FOOTER,
+            action_footer=(
+                (PASSED_FOOTER if allow_close else PASSED_PR_FOOTER) if passed else FAILED_FOOTER
+            ),
             model=getattr(self.llm, "model", "unknown"),
             timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             marker=cfg.review_marker(commit_sha),
@@ -733,6 +764,7 @@ class CodeReviewer:
         *,
         dry_run: Optional[bool] = None,
         force: bool = False,
+        allow_close: bool = True,
     ) -> dict[str, Any]:
         """
         执行一次完整审核。
@@ -741,6 +773,10 @@ class CodeReviewer:
         :param after_sha: push 后的 SHA（本次提交）
         :param dry_run: 演练模式（只打印报告，不写 GitHub）；默认用实例配置
         :param force: 忽略“已审核过”的判断，强制重新评论
+        :param allow_close: 过审时是否允许「打 done 标签 + 关闭 Issue」。
+            传 ``False`` 表示**只审核不定案**（PR 场景）：
+            评论照发、看板能看到审核结论，但 Issue 保持打开，
+            等 PR 合并到主干后由 push 事件那一轮再关闭 —— 避免“还没合就算完成”。
         :return: 审核结果摘要字典
         """
         dry = self.dry_run if dry_run is None else dry_run
@@ -787,6 +823,22 @@ class CodeReviewer:
         issue_numbers = self.get_linked_issues(commit_message)
         if not issue_numbers:
             reason = "提交信息中没有关联 Issue，跳过审核（写法：close #1 / fixes #1 / 直接写 #1）"
+            logger.warning(reason)
+            summary.update({"skipped": True, "reason": reason})
+            return summary
+
+        # GitHub 里 PR 和 Issue 共用编号空间：squash 合并产生的提交信息会带 "(#12)"，
+        # 那是 PR 编号、不是 Issue 编号。PR 不参与 Agent 定案（合并后 GitHub 自己会关 Issue），
+        # 而且 Actions 的 GITHUB_TOKEN 通常也没有 PR 的写权限（去评论只会 403）。
+        issue_numbers, pr_numbers = self._split_pr_numbers(issue_numbers)
+        if pr_numbers:
+            logger.info("忽略关联到的 Pull Request 编号：%s（PR 不参与 Agent 审核定案）",
+                        "、".join(f"#{number}" for number in pr_numbers))
+            summary["pr_numbers"] = pr_numbers
+
+        if not issue_numbers:
+            reason = (f"提交信息只关联到 Pull Request（{'、'.join(f'#{n}' for n in pr_numbers)}），"
+                      f"没有关联到 Issue：跳过审核（不调用 LLM）")
             logger.warning(reason)
             summary.update({"skipped": True, "reason": reason})
             return summary
@@ -838,9 +890,11 @@ class CodeReviewer:
         summary["passed"] = bool(result.get("passed"))
         summary["score"] = result.get("score", 0)
         summary["parse_failed"] = bool(result.get("parse_failed"))
+        summary["allow_close"] = bool(allow_close)
 
-        logger.info("审核结论：%s（score=%s）",
-                    "✅ 通过" if summary["passed"] else "❌ 不通过", summary["score"])
+        logger.info("审核结论：%s（score=%s）%s",
+                    "✅ 通过" if summary["passed"] else "❌ 不通过", summary["score"],
+                    "" if allow_close else "（PR 模式：只审核不定案，等合并后再关闭 Issue）")
 
         # ---- 6. 逐个 Issue 处理 ----
         # 单个 Issue 失败（最常见：提交信息里的编号写错/不存在）只影响它自己，
@@ -857,6 +911,7 @@ class CodeReviewer:
                         stats=stats,
                         dry_run=dry,
                         force=force,
+                        allow_close=allow_close,
                     )
                 )
             except ReviewError as exc:
@@ -892,9 +947,10 @@ class CodeReviewer:
         stats: dict[str, Any],
         dry_run: bool = False,
         force: bool = False,
+        allow_close: bool = True,
     ) -> dict[str, Any]:
         """
-        处理单个 Issue：留评语；过审才改标签为 done 并关闭。
+        处理单个 Issue：留评语；过审且 ``allow_close`` 时才改标签为 done 并关闭。
 
         :param issue_number: Issue 编号
         :param result: LLM 结论
@@ -904,6 +960,7 @@ class CodeReviewer:
         :param stats: diff 统计
         :param dry_run: 演练模式
         :param force: 强制重新评论（忽略去重）
+        :param allow_close: False = PR 场景「只审核不定案」
         :return: 处理结果字典
         """
         info: dict[str, Any] = {
@@ -914,7 +971,8 @@ class CodeReviewer:
             "skipped": False,
         }
 
-        report = self._build_report(result, commit_message, commit_title, commit_sha, stats)
+        report = self._build_report(result, commit_message, commit_title, commit_sha, stats,
+                                    allow_close=allow_close)
 
         # ---- 演练模式：只打印，不碰 GitHub ----
         if dry_run:
@@ -938,6 +996,12 @@ class CodeReviewer:
 
         # ---- 过审才改状态 ----
         if result.get("passed"):
+            if not allow_close:
+                # PR 场景：只留评语，不动标签、不关 Issue
+                info["deferred"] = True
+                logger.info("Issue #%s 审核通过，但这是 PR 提交：等合并到主干后再标记完成",
+                            issue_number)
+                return info
             self.update_issue_labels(
                 issue_number,
                 add_labels=["done"],

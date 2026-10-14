@@ -199,9 +199,26 @@ DONE_IS_FINAL: bool = _env_bool("DONE_IS_FINAL", True)
 LOGIN_BY_REAL_NAME_ONLY: bool = _env_bool("LOGIN_BY_REAL_NAME_ONLY", True)
 
 # 是否允许把任务指派给别人。
-# 默认 False：只能「认领给自己」或「把自己名下的放回未分配」，
-# 谁也不能把任务塞给别人（这也是「只能提交自己所属内容」的前提）。
+# 默认 False：组员只能「认领给自己」或「把自己名下的放回未分配」。
+# 注意：**组长不受这条限制**（角色存在 users.role 里，用 python auth.py role 设置）；
+# 把这里设为 True 等于「所有人都是组长」。
 ALLOW_ASSIGN_TO_OTHERS: bool = _env_bool("ALLOW_ASSIGN_TO_OTHERS", False)
+
+# ============================================================
+# 分支 / Pull Request
+# ============================================================
+# 默认主干分支名（建分支时的起点、提 PR 的 base）
+DEFAULT_BRANCH: str = _env("DEFAULT_BRANCH", "main")
+
+# 默认合并方式：merge / squash / rebase
+PR_MERGE_METHOD: str = _env("PR_MERGE_METHOD", "squash").lower()
+
+# 单次同步最多刷新多少个 PR 的状态（保护 API 额度）
+PR_SYNC_BUDGET: int = _env_int("PR_SYNC_BUDGET", 25)
+
+# 提 PR 时自动写进正文的模板（{issue} 会替换成编号）
+# Closes #N 让 GitHub 在合并时自动关闭 Issue —— 这正是「合并后才进 Done」的机制
+PR_BODY_TEMPLATE: str = _env("PR_BODY_TEMPLATE", "关联任务 #{issue}\n\nCloses #{issue}\n")
 
 # ============================================================
 # 看板业务配置

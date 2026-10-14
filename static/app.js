@@ -51,7 +51,9 @@ let statusTimer = null;                           // 状态条自动清除定时
 let me = null;                                    // 当前登录用户 {username, display_name, ...}
 let doneRequiresAgent = true;                     // 「完成」是否只能由 Agent 写入
 let doneIsFinal = true;                          // 已完成的任务是否不允许再改动（终态）
-let allowAssignToOthers = false;                  // 是否允许把任务指派给别人（默认不允许）
+let allowAssignToOthers = false;                  // 是否允许把任务指派给别人（组长恒为 true）
+let isLead = false;                              // 当前登录者是不是组长
+let canMergePr = false;                          // 能否放行 / 合并 PR（组长）
 
 /* ============================================================
    DOM 引用
@@ -100,6 +102,17 @@ const el = {
     pwdNew2: $('input-new-pwd2'),
     btnPwdCancel: $('btn-pwd-cancel'),
     btnPwdConfirm: $('btn-pwd-confirm'),
+    // 分支 / PR 面板
+    prModal: $('pr-modal'),
+    prTaskLine: $('pr-task-line'),
+    prBranch: $('pr-branch'),
+    prBase: $('pr-base'),
+    prStatus: $('pr-status'),
+    btnPrClose: $('btn-pr-close'),
+    btnBranch: $('btn-branch'),
+    btnPrOpen: $('btn-pr-open'),
+    btnPrAllow: $('btn-pr-allow'),
+    btnPrMerge: $('btn-pr-merge'),
 };
 
 /* ============================================================
@@ -195,11 +208,13 @@ function isUnassigned(task) {
 
 /**
  * 能否操作这个任务。
- * 后端会在每条任务上算好 can_edit，这里优先用它，保证前后端规则一致。
+ *
+ * 后端会在每条任务上算好 ``can_edit``（它已经考虑组长的权限），这里优先用它，
+ * 保证前后端规则一致；拿不到该字段时才回退到本地判断 —— 回退里同样要认组长。
  */
 function canEdit(task) {
     if (typeof task.can_edit === 'boolean') return task.can_edit;
-    return isMyTask(task) || isUnassigned(task);
+    return isLead || isMyTask(task) || isUnassigned(task);
 }
 
 /** 把 ISO 时间转成“x 分钟前”这类相对时间显示。 */
@@ -896,6 +911,18 @@ function buildCard(task) {
     // Agent 审核结果（徽章 + 可展开的 AI 评语）
     renderReview(node, task);
 
+    // PR：有 PR 就显示编号与状态（open / draft / 待放行 / 已放行 / merged）
+    renderPrChip(node, task);
+
+    // 「PR」按钮：打开分支 / PR 面板（建分支、提 PR、组长放行与合并）
+    const prBtn = node.querySelector('.pr-btn');
+    if (prBtn) {
+        prBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            openPrPanel(task);
+        });
+    }
+
     // 分支与提交（同步时抓取，可能为空）
     const meta = node.querySelector('.card-meta');
     const commits = Array.isArray(task.commits) ? task.commits : [];
@@ -1026,6 +1053,209 @@ function buildCard(task) {
 }
 
 /* ============================================================
+   分支 / PR
+   ============================================================ */
+/** PR 状态的显示文案与配色类。 */
+const PR_STATE_TEXT = {
+    open: '待审核',
+    draft: '草稿',
+    merged: '已合并',
+    closed: '已关闭',
+};
+
+/**
+ * 渲染卡片上的 PR 徽章（没有 PR 时整块隐藏）。
+ *
+ * 状态由两部分决定：GitHub 的 PR 状态 + 本地「组长是否已放行」。
+ */
+function renderPrChip(node, task) {
+    const wrap = node.querySelector('.card-pr');
+    const chip = node.querySelector('.pr-chip');
+    if (!wrap || !chip) return;
+
+    if (!task.pr_number) {
+        wrap.hidden = true;
+        return;
+    }
+
+    const state = task.pr_state || 'open';
+    let text = `PR #${task.pr_number}`;
+    let variant = state;
+    if (state === 'open' && task.pr_allowed) {
+        variant = 'allowed';
+        text += ' 已放行';
+    } else if (state === 'open') {
+        text += ' 待放行';
+    } else {
+        text += ' ' + (PR_STATE_TEXT[state] || state);
+    }
+
+    wrap.hidden = false;
+    chip.className = 'pr-chip pr-' + variant;
+    setText(chip, text);
+    chip.title = `PR #${task.pr_number}（${PR_STATE_TEXT[state] || state}）`
+        + (task.pr_allowed_by ? ` · 已由 ${assigneeLabel(task.pr_allowed_by)} 放行` : '')
+        + ' · 点击打开分支/PR 面板';
+
+    chip.onclick = (event) => {
+        event.stopPropagation();
+        if (task.pr_url) {
+            // 直接点开 GitHub 上的 PR，省一步
+            window.open(task.pr_url, '_blank', 'noopener');
+        } else {
+            openPrPanel(task);
+        }
+    };
+}
+
+/** 当前正在操作 PR 的任务。 */
+let prTask = null;
+
+/** 打开分支 / PR 面板。 */
+function openPrPanel(task) {
+    prTask = task;
+    if (!el.prModal) return;
+
+    setText(el.prTaskLine, `#${task.issue_number} ${task.title || ''}`.trim());
+    el.prBranch.value = task.branch || defaultBranchName(task);
+    el.prBase.value = task.pr_base || 'main';
+    renderPrPanelState(task);
+
+    // 只有组长看得到「允许合并 / 合并」
+    [el.btnPrAllow, el.btnPrMerge].forEach((button) => {
+        if (button) button.hidden = !canMergePr;
+    });
+
+    showModal(el.prModal);
+}
+
+/** 刷新面板里的状态说明与按钮可用性。 */
+function renderPrPanelState(task) {
+    const lines = [];
+    if (task.branch) {
+        lines.push(`分支：<code>${escapeHtml(task.branch)}</code>`);
+    } else {
+        lines.push('还没有分支：点「建分支」会基于目标分支创建。');
+    }
+
+    if (task.pr_number) {
+        const state = PR_STATE_TEXT[task.pr_state] || task.pr_state || '未知';
+        lines.push(`PR：<a href="${task.pr_url || '#'}" target="_blank" rel="noopener noreferrer">`
+            + `#${task.pr_number}</a>（${state}${task.pr_allowed ? ' · 已放行' : ' · 待组长放行'}）`);
+        if (task.pr_state === 'merged') {
+            lines.push('已合并：等下一次同步，GitHub 关闭 Issue 后卡片会自动进 Done。');
+        }
+    } else {
+        lines.push('还没有 PR：把代码推到分支后点「提 PR」。');
+    }
+    lines.push(canMergePr
+        ? '你是组长：可以放行并合并。'
+        : '放行与合并只有组长能做；提 PR 后等组长处理。');
+
+    if (el.prStatus) {
+        el.prStatus.innerHTML = lines.join('<br>');   // 内容全部来自后端字段/常量，已转义
+    }
+
+    if (el.btnBranch) el.btnBranch.disabled = false;
+    if (el.btnPrOpen) el.btnPrOpen.disabled = Boolean(task.pr_number && task.pr_state !== 'closed');
+    if (el.btnPrAllow) {
+        el.btnPrAllow.disabled = !task.pr_number || task.pr_state === 'merged' || task.pr_allowed;
+    }
+    if (el.btnPrMerge) {
+        el.btnPrMerge.disabled = !task.pr_number || task.pr_state === 'merged' || !task.pr_allowed;
+    }
+}
+
+/** 极简 HTML 转义（面板里用 innerHTML 拼小段说明时用）。 */
+function escapeHtml(text) {
+    return String(text == null ? '' : text)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+/** 默认分支名（与后端 _branch_name_for 保持一致）。 */
+function defaultBranchName(task) {
+    const slug = String(task.title || '')
+        .replace(/[^0-9A-Za-z]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase().slice(0, 24)
+        .replace(/^-+|-+$/g, '');
+    return slug ? `task/${task.issue_number}-${slug}` : `task/${task.issue_number}`;
+}
+
+/** 等 PR 相关操作结束后刷新数据。 */
+async function refreshAfterPrAction(message) {
+    showStatus(message, 'success');
+    await loadTasks(true);
+    const fresh = tasks.find((item) => item.issue_number === prTask?.issue_number);
+    if (fresh && el.prModal && el.prModal.classList.contains('active')) {
+        prTask = fresh;
+        renderPrPanelState(fresh);
+    }
+}
+
+/** 建分支。 */
+async function createBranchForTask() {
+    if (!prTask) return;
+    const name = el.prBranch.value.trim() || defaultBranchName(prTask);
+    const base = el.prBase.value.trim() || 'main';
+    if (el.btnBranch) el.btnBranch.disabled = true;
+    try {
+        const data = await api(`/api/tasks/${prTask.issue_number}/branch`, {
+            method: 'POST',
+            body: JSON.stringify({ name, from: base }),
+        });
+        await refreshAfterPrAction(data.message || `已创建分支 ${name}`);
+    } catch (error) {
+        // api() 已经提示过
+    } finally {
+        if (el.btnBranch) el.btnBranch.disabled = false;
+    }
+}
+
+/** 提 PR。 */
+async function openPrForTask() {
+    if (!prTask) return;
+    const head = el.prBranch.value.trim() || prTask.branch || defaultBranchName(prTask);
+    const base = el.prBase.value.trim() || 'main';
+    if (el.btnPrOpen) el.btnPrOpen.disabled = true;
+    try {
+        const data = await api(`/api/tasks/${prTask.issue_number}/pr`, {
+            method: 'POST',
+            body: JSON.stringify({ head, base }),
+        });
+        await refreshAfterPrAction(data.message || '已提交 PR');
+    } catch (error) {
+        // api() 已经提示过
+    } finally {
+        if (el.btnPrOpen) el.btnPrOpen.disabled = false;
+    }
+}
+
+/** 组长：放行 PR。 */
+async function allowPrForTask() {
+    if (!prTask) return;
+    try {
+        const data = await api(`/api/tasks/${prTask.issue_number}/pr/allow`, { method: 'POST' });
+        await refreshAfterPrAction(data.message || '已放行');
+    } catch (error) {
+        // api() 已经提示过
+    }
+}
+
+/** 组长：合并 PR。 */
+async function mergePrForTask() {
+    if (!prTask) return;
+    if (!confirm(`确定合并 PR #${prTask.pr_number} 吗？\n（合并后 GitHub 会关闭 Issue，卡片会在下次同步进 Done）`)) {
+        return;
+    }
+    try {
+        const data = await api(`/api/tasks/${prTask.issue_number}/pr/merge`, { method: 'POST' });
+        await refreshAfterPrAction(data.message || '已合并');
+    } catch (error) {
+        // api() 已经提示过
+    }
+}
+
+/* ============================================================
    写操作：改状态 / 改负责人 / 新建 / 删除 / 同步
    ============================================================ */
 /** 清除所有列的高亮。 */
@@ -1101,10 +1331,10 @@ function moveTask(issueNumber, newStatus) {
         return false;
     }
 
-    // ④ 别人的任务不能动
-    if (!unassigned && !isMyTask(task)) {
+    // ④ 别人的任务：组长可以推着走（替团队收尾），组员不行
+    if (!unassigned && !isMyTask(task) && !isLead) {
         const owner = safeAssignee(task);
-        showStatus(`这是 ${assigneeLabel(owner)} 的任务，你只能操作自己的任务`, 'error');
+        showStatus(`这是 ${assigneeLabel(owner)} 的任务，只有本人或组长能改`, 'error');
         return false;
     }
 
@@ -1135,8 +1365,9 @@ function moveTask(issueNumber, newStatus) {
 /**
  * 修改任务负责人（人员视图拖拽 / ← → 按钮 / 徽章选择器）。
  *
- * 规则（默认）：只能认领给自己，或把自己名下的放回「未分配」；
- * **不能把任务指派给别人**——谁也不能把活塞给谁。
+ * 规则：
+ *   * **组长**：可以把任何卡片指派给任何人（分派任务）
+ *   * 组员：只能认领给自己，或把自己名下的放回「未分配」；不能把活塞给别人
  *
  * @param {number} issueNumber Issue 编号
  * @param {string} newAssignee 目标负责人；空串表示未分配
@@ -1150,26 +1381,29 @@ function assignTask(issueNumber, newAssignee) {
     const previous = safeAssignee(task);
     if (previous === target) return false;
 
-    if (previous && !isMyTask(task)) {
-        showStatus(`这是 ${assigneeLabel(previous)} 的任务，只有本人能改负责人`, 'error');
+    if (!isLead && previous && !isMyTask(task)) {
+        showStatus(`这是 ${assigneeLabel(previous)} 的任务，只有本人或组长能改负责人`, 'error');
         return false;
     }
 
     if (!canAssignTo(target)) {
-        showStatus(`不能把任务指派给 ${assigneeLabel(target)}：只有本人能认领任务`, 'error');
+        showStatus(`不能把任务指派给 ${assigneeLabel(target)}：只有组长能分派，组员只能自己认领`, 'error');
         return false;
     }
 
     task.assignee = target;
     render();
-    showStatus(`正在把 #${issueNumber} 指派给 ${assigneeLabel(target)}…`, 'loading');
+    const verb = isLead ? '分派给' : '指派给';
+    showStatus(`正在把 #${issueNumber} ${verb} ${assigneeLabel(target)}…`, 'loading');
 
     sendUpdate(
         `/api/tasks/${issueNumber}/assignee`,
         { assignee: target },
         { rollback: () => { task.assignee = previous; } },
         target
-            ? `#${issueNumber} 已认领给你（GitHub 正文已同步）`
+            ? (isLead
+                ? `#${issueNumber} 已分派给 ${assigneeLabel(target)}（GitHub 正文已同步）`
+                : `#${issueNumber} 已认领给你（GitHub 正文已同步）`)
             : `#${issueNumber} 已放回「未分配」，等本人认领`
     );
     return true;
@@ -1431,11 +1665,14 @@ async function loadMe() {
     doneRequiresAgent = info.done_requires_agent !== false;
     doneIsFinal = info.done_is_final !== false;
     allowAssignToOthers = info.allow_assign_to_others === true;
+    isLead = info.is_lead === true;
+    canMergePr = info.can_merge_pr === true;
 
-    // 界面上不展示代号（太难听），只显示真实姓名
-    setText(el.userName, info.display_name || '我');
+    // 界面上不展示代号（太难听），只显示真实姓名；组长多一个标记
+    setText(el.userName, (info.display_name || '我') + (isLead ? '（组长）' : ''));
     el.userChip.hidden = false;
-    el.userChip.title = `已登录：${info.display_name || '我'}`;
+    el.userChip.title = `已登录：${info.display_name || '我'}${isLead ? '（组长）' : ''}`;
+    el.userChip.classList.toggle('user-chip-lead', isLead);
 
     // 还在用初始密码 → 在用户名旁边挂一个提醒态的圆圈 i（不再往状态条里塞提示）
     if (el.defaultPwdHint) {
@@ -1447,6 +1684,11 @@ async function loadMe() {
             el.defaultPwdHint.hidden = true;
         }
     }
+}
+
+/** 能否管理这张卡（组长可以管任何卡片；组员只管自己的/未分配的）。 */
+function canManageTask(task) {
+    return isLead || isMyTask(task) || !safeAssignee(task);
 }
 
 /**
@@ -1562,11 +1804,22 @@ el.modal.addEventListener('click', (event) => {
     if (event.target.dataset.close) closeModal();
 });
 
+// 分支 / PR 面板
+el.btnPrClose.addEventListener('click', () => dismissModal(el.prModal));
+el.btnBranch.addEventListener('click', createBranchForTask);
+el.btnPrOpen.addEventListener('click', openPrForTask);
+el.btnPrAllow.addEventListener('click', allowPrForTask);
+el.btnPrMerge.addEventListener('click', mergePrForTask);
+el.prModal.addEventListener('click', (event) => {
+    if (event.target.dataset.closePr) dismissModal(el.prModal);
+});
+
 // 键盘：Esc 关闭弹窗，弹窗内 Ctrl/Cmd + Enter 提交
 document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
         if (el.modal.classList.contains('active')) closeModal();
         if (el.pwdModal.classList.contains('active')) closePwdModal();
+        if (el.prModal.classList.contains('active')) dismissModal(el.prModal);
     }
     if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && el.modal.classList.contains('active')) {
         createTask();

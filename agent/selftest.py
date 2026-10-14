@@ -196,6 +196,7 @@ class FakeGitHub:
         marker_sha: str = "b" * 40,
         raw_diff: str = "",
         missing_issues: Optional[set[int]] = None,
+        pull_request_issues: Optional[set[int]] = None,
     ) -> None:
         self.files = files
         self.message = message
@@ -205,6 +206,7 @@ class FakeGitHub:
         self.marker_sha = marker_sha
         self.raw_diff = raw_diff
         self.missing_issues = set(missing_issues or ())
+        self.pull_request_issues = set(pull_request_issues or ())
         self.calls: list[dict[str, Any]] = []
 
     # -- 与真实 _request 保持同样的契约：非 allow 的状态码抛 ReviewError --
@@ -272,13 +274,17 @@ class FakeGitHub:
             return 200, {"number": int(path.rsplit("/", 1)[-1]), "state": "closed"}
         if "/issues/" in path and method == "GET":
             number = int(path.rsplit("/", 1)[-1])
-            return 200, {
+            payload: dict[str, Any] = {
                 "number": number,
                 "title": "完成点云生成模块",
                 "body": "**负责人**: 小美",
                 "state": self.issue_state,
                 "labels": [{"name": "doing"}],
             }
+            if number in self.pull_request_issues:
+                # GitHub 的 issue 对象里带 pull_request 字段 = 它其实是 PR
+                payload["pull_request"] = {"url": f"https://example.test/pulls/{number}"}
+            return 200, payload
         raise AssertionError(f"FakeGitHub 未处理的请求：{method} {path}")
 
     # -- 查询辅助 --
@@ -503,6 +509,42 @@ def test_review_passed() -> None:
     prompt = reviewer.llm.calls[0][1]
     check("提示词含 diff", "pointcloud.py" in prompt, prompt[:200])
     check("提示词含关联 Issue 信息", "#1" in prompt and "完成点云生成模块" in prompt)
+
+
+def test_review_no_close() -> None:
+    """PR 场景：allow_close=False 时只留评语，不打 done、不关 Issue。"""
+    print("[3b] review() PR 模式：只审核不定案")
+    fake = FakeGitHub([make_diff_file()], "feat: 完成点云生成模块\n\ncloses #1")
+    reviewer = make_reviewer(fake, FakeLLM(passed=True, score=95))
+
+    result = reviewer.review("a" * 40, "b" * 40, allow_close=False)
+
+    check("未跳过", result["skipped"] is False, result)
+    check("判定通过", result["passed"] is True, result)
+    check("仍然发布了评论", fake.called("POST", "/comments"), fake.calls)
+    check("没有添加 done 标签",
+          not any(c["json"] == {"labels": ["done"]} for c in fake.find("POST", "/labels")), fake.calls)
+    check("没有关闭 Issue", not fake.called("PATCH", "/issues/1"), fake.calls)
+    check("处理结果标记为「延后定案」", result["handled"][0].get("deferred") is True,
+          result["handled"])
+    check("summary 里记录了 allow_close=False", result.get("allow_close") is False, result)
+    check("报告里说明等合并后再标记完成",
+          "合并" in [c for c in fake.find("POST", "/comments")][0]["json"]["body"], "")
+
+
+def test_pr_number_ignored() -> None:
+    """squash 合并带来的 “(#1)” 是 PR 编号：要当成 PR 忽略，不能去评论它。"""
+    print("[3c] review() 关联到 PR 编号时跳过（不调用 LLM）")
+    fake = FakeGitHub([make_diff_file()], "test: 自检文件 (#1)", pull_request_issues={1})
+    reviewer = make_reviewer(fake, FakeLLM(passed=True, score=90))
+
+    result = reviewer.review("a" * 40, "b" * 40)
+
+    check("跳过了审核", result["skipped"] is True, result)
+    check("跳过原因说明了是 PR", "Pull Request" in (result.get("reason") or ""), result.get("reason"))
+    check("识别出 #1 是 PR", result.get("pr_numbers") == [1], result.get("pr_numbers"))
+    check("没有调用 LLM（没花钱）", reviewer.llm.calls == [], reviewer.llm.calls)
+    check("没有给 PR 评论", not fake.called("POST", "/comments"), fake.calls)
 
 
 def test_review_failed() -> None:
@@ -897,6 +939,8 @@ def main() -> int:
     test_linked_issues()
     test_json_parsing()
     test_review_passed()
+    test_review_no_close()
+    test_pr_number_ignored()
     test_review_failed()
     test_review_llm_error()
     test_review_paths()

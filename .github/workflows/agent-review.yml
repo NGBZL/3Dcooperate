@@ -2,12 +2,16 @@ name: Agent Code Review
 
 # ============================================================
 # 触发条件
-#   1. 有代码 push 到 main / master 分支（自动审核）
-#   2. 手动触发（workflow_dispatch），可指定要审核的 commit 区间
+#   1. 有代码 push 到 main / master 分支（自动审核，过审即关闭关联 Issue）
+#   2. 打开 / 更新 Pull Request（自动审核，但**只审核不定案**：
+#      照发评语、看板能看到结论，Issue 保持打开，等合并到主干后再关闭）
+#   3. 手动触发（workflow_dispatch），可指定要审核的 commit 区间
 # ============================================================
 on:
   push:
     branches: [main, master]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       before_sha:
@@ -25,9 +29,10 @@ concurrency:
   group: agent-review-${{ github.ref }}
   cancel-in-progress: false
 
-# 需要写 Issue（评论 / 打标签 / 关闭），读取代码
+# 需要写 Issue（评论 / 打标签 / 关闭）+ 读 Pull Request，读取代码
 permissions:
   contents: read
+  pull-requests: read
   issues: write
 
 jobs:
@@ -62,9 +67,16 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
 
-          # 审核范围：手动触发时用输入值，push 时用事件自带的 before/after
-          BEFORE_SHA: ${{ github.event.inputs.before_sha || github.event.before }}
-          COMMIT_SHA: ${{ github.event.inputs.after_sha || github.sha }}
+          # 事件名：pull_request 时 agent 会「只审核不定案」（不打 done、不关 Issue），
+          # 等 PR 合并到主干后的那次 push 才真正定案
+          EVENT_NAME: ${{ github.event_name }}
+
+          # 审核范围：
+          #   · 手动触发 → 用输入值
+          #   · PR 事件 → 用 PR 的 base/head（审这次 PR 的全部改动）
+          #   · push    → 用事件自带的 before/after
+          BEFORE_SHA: ${{ github.event.inputs.before_sha || github.event.pull_request.base.sha || github.event.before }}
+          COMMIT_SHA: ${{ github.event.inputs.after_sha || github.event.pull_request.head.sha || github.sha }}
 
           # 大模型配置：需要在仓库 Secrets 里配置 LLM_API_KEY
           # （LLM_API_URL / LLM_MODEL 不配也能跑，用 || 提供默认值，

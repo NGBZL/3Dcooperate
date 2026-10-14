@@ -159,6 +159,42 @@
     </div>
 </div>
 
+<!-- ===================== 分支 / PR 弹窗 ===================== -->
+<div class="modal" id="pr-modal" aria-hidden="true">
+    <div class="modal-mask" data-close-pr="1"></div>
+    <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="pr-title">
+        <div class="modal-head">
+            <h3 id="pr-title">分支与 PR</h3>
+            <!-- 流程说明收进圆圈 i -->
+            <button class="hint hint-start" id="pr-help" type="button" aria-label="分支与 PR 说明"
+                    data-hint="流程：① 建分支（默认 task/编号-slug，基于 main）→ ② 把代码推到该分支 → ③ 提 PR（正文自动写 Closes #编号）→ ④ 组长放行 → ⑤ 组长合并。合并后 GitHub 自动关闭 Issue，看板同步后卡片进 Done。组员只能操作自己的任务；放行与合并只有组长能做。"></button>
+        </div>
+
+        <p class="modal-tip-line" id="pr-task-line"></p>
+
+        <div class="field-row">
+            <div class="field">
+                <label for="pr-branch">分支名</label>
+                <input type="text" id="pr-branch" placeholder="task/12-fix">
+            </div>
+            <div class="field">
+                <label for="pr-base">目标分支</label>
+                <input type="text" id="pr-base" value="main">
+            </div>
+        </div>
+
+        <div class="pr-status" id="pr-status"></div>
+
+        <div class="modal-actions pr-actions">
+            <button class="btn btn-secondary" id="btn-pr-close" type="button">关闭</button>
+            <button class="btn btn-secondary" id="btn-branch" type="button">建分支</button>
+            <button class="btn btn-primary" id="btn-pr-open" type="button">提 PR</button>
+            <button class="btn btn-secondary lead-only" id="btn-pr-allow" type="button" hidden>允许合并</button>
+            <button class="btn btn-primary lead-only" id="btn-pr-merge" type="button" hidden>合并</button>
+        </div>
+    </div>
+</div>
+
 <!-- ===================== 模板 ===================== -->
 
 <!-- 看板列模板：状态视图与人员视图共用 -->
@@ -192,10 +228,15 @@
             <button class="review-badge" type="button" aria-expanded="false"></button>
             <div class="review-comment" hidden></div>
         </div>
+        <!-- PR / 分支：有 PR 时显示编号与状态，点击打开分支 / PR 面板 -->
+        <div class="card-pr" hidden>
+            <button class="pr-chip" type="button" title="分支与 PR"></button>
+        </div>
         <div class="card-meta" hidden></div>
         <div class="card-footer">
             <span class="card-time"></span>
             <div class="card-actions">
+                <button class="icon-btn pr-btn" type="button" title="分支与 PR">PR</button>
                 <button class="icon-btn move-left" type="button" title="移到上一列">←</button>
                 <button class="icon-btn move-right" type="button" title="移到下一列">→</button>
                 <button class="icon-btn danger delete-btn" type="button" title="从看板移除（可恢复）">×</button>

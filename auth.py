@@ -51,6 +51,13 @@ logger = logging.getLogger(__name__)
 # 会话里存放登录名的键
 SESSION_USER_KEY = "username"
 
+# 角色：
+#   member —— 普通组员：只能领取任务、推进自己名下的任务
+#   lead   —— 组长：可以给任何人分派任务、改任何卡片、放行并合并 PR
+ROLE_MEMBER = "member"
+ROLE_LEAD = "lead"
+ROLES = (ROLE_MEMBER, ROLE_LEAD)
+
 # 也允许用「真名」登录：真名 -> 代号 的反向查找由 config.assignee_code() 完成
 
 # 登录失败计数：{代号: (失败次数, 锁定到什么时候)}，进程内存即可（单机部署）
@@ -101,6 +108,47 @@ def ensure_default_users() -> list[str]:
         logger.warning("=" * 56)
 
     return created
+
+
+# ============================================================
+# 角色（组长 / 组员）
+# ============================================================
+def user_role(username: str) -> str:
+    """
+    取用户角色（数据库里没有记录时按组员处理）。
+
+    :param username: 登录名（代号）
+    :return: 'lead' 或 'member'
+    """
+    if not username:
+        return ROLE_MEMBER
+    user = database.get_user(username)
+    role = (user or {}).get("role") or ROLE_MEMBER
+    return role if role in ROLES else ROLE_MEMBER
+
+
+def is_lead(username: str) -> bool:
+    """是否是组长。"""
+    return user_role(username) == ROLE_LEAD
+
+
+def lead_only_message(action: str = "这个操作") -> str:
+    """非组长做组长专属操作时的提示。"""
+    return f"{action}只有组长可以做（让组长登录后操作，或用 python auth.py role 设为 lead）"
+
+
+def check_lead(username: str) -> str:
+    """
+    校验「只有组长能做」的操作。
+
+    :param username: 当前登录名
+    :return: 错误信息；空串表示允许
+    """
+    if not username:
+        return "请先登录"
+    if is_lead(username):
+        return ""
+    return lead_only_message()
 
 
 # ============================================================
@@ -315,11 +363,16 @@ def user_public_info(user: dict[str, Any]) -> dict[str, Any]:
     :return: {username, display_name, is_default_password}
     """
     username = user["username"]
+    role = user.get("role") or ROLE_MEMBER
+    if role not in ROLES:
+        role = ROLE_MEMBER
     return {
         "username": username,
         # 真名由本地映射表翻译，数据库里不存真名
         "display_name": assignee_display(username) or username,
         "is_default_password": is_default_password(username),
+        "role": role,
+        "is_lead": role == ROLE_LEAD,
     }
 
 
@@ -403,6 +456,7 @@ def can_edit_task(task: dict[str, Any], username: str) -> bool:
     能否操作该任务（是否可拖拽 / 可否改状态）。
 
     规则：
+      * **组长 → 任何任务都可以**（要能给别人分派、也要能替团队收尾）
       * 负责人是自己 → 可以
       * 任务未分配   → 可以（先去认领）
       * 别人的任务   → 不可以
@@ -411,6 +465,8 @@ def can_edit_task(task: dict[str, Any], username: str) -> bool:
     :param username: 当前登录名
     :return: 是否允许
     """
+    if is_lead(username):
+        return True
     owner = task_owner(task)
     return (not owner) or owner == username
 
@@ -423,6 +479,8 @@ def check_status_permission(task: dict[str, Any], username: str) -> str:
     :param username: 当前登录名
     :return: 错误信息；空串表示允许
     """
+    if is_lead(username):
+        return ""            # 组长可以推进任何人的卡片
     owner = task_owner(task)
     if not owner:
         return "这个任务还没有负责人，请先把它指派给自己再开始工作"
@@ -437,41 +495,47 @@ def check_assign_permission(
     """
     校验「改负责人」的权限。
 
-    默认策略（ALLOW_ASSIGN_TO_OTHERS=False）：
+    策略：
 
-    * **不能把任务指派给别人**——谁也不能把活塞给谁，只能本人自己认领
-    * 未分配的任务 → 任何人都可以认领给自己
-    * 自己名下的任务 → 可以放回「未分配」，但不能转给第三人
-    * 别人的任务 → 一律不许动
+    * **组长可以随便分派**：任何任务 → 任何人（含从别人手里拿走、直接派给某人）
+    * 组员（ALLOW_ASSIGN_TO_OTHERS=False 时）：
+      - **不能把任务指派给别人**：只能本人自己认领
+      - 未分配的任务 → 任何人都可以认领给自己
+      - 自己名下的任务 → 可以放回「未分配」，但不能转给第三人
+      - 别人的任务 → 一律不许动
+    * 若把 ``ALLOW_ASSIGN_TO_OTHERS`` 设为 1，则等于「所有人都是组长」
 
     :param task: 任务字典
     :param username: 当前登录名
     :param new_assignee: 目标负责人代号；空串表示取消分配
     :return: 错误信息；空串表示允许
     """
+    if is_lead(username) or ALLOW_ASSIGN_TO_OTHERS:
+        return ""
+
     owner = task_owner(task)
 
     # 别人的任务：无论怎么改都不允许
     if owner and owner != username:
         return f"这是 {assignee_display(owner)} 的任务，你只能操作自己的任务"
 
-    if not ALLOW_ASSIGN_TO_OTHERS:
-        # 想指派给别人（既不是自己，也不是「未分配」）→ 拒绝
-        if new_assignee and new_assignee != username:
-            return (f"不能把任务指派给 {assignee_display(new_assignee)}："
-                    f"只有本人能认领任务（把它放到「未分配」列，让对方自己认领）")
-
+    # 想指派给别人（既不是自己，也不是「未分配」）→ 拒绝
+    if new_assignee and new_assignee != username:
+        return (f"不能把任务指派给 {assignee_display(new_assignee)}："
+                f"只有本人能认领任务（把它放到「未分配」列，让对方自己认领）")
     return ""
 
 
 def check_delete_permission(task: dict[str, Any], username: str) -> str:
     """
-    校验「删除本地缓存」的权限。
+    校验「从看板移除」的权限。
 
     :param task: 任务字典
     :param username: 当前登录名
     :return: 错误信息；空串表示允许
     """
+    if is_lead(username):
+        return ""
     owner = task_owner(task)
     if not owner or owner == username:
         return ""
@@ -509,9 +573,11 @@ def _cli(argv: list[str]) -> int:
 
     用法::
 
-        python auth.py list                        # 看有哪些人、谁还在用初始密码
+        python auth.py list                        # 看有哪些人、谁还在用初始密码、谁是组长
         python auth.py reset 小美                   # 把某人密码重置成 config.DEFAULT_PASSWORD
         python auth.py reset 小美 新的密码            # 重置成指定密码
+        python auth.py role 小美 lead              # 把某人设为组长（可给任何人分派任务、放行并合并 PR）
+        python auth.py role 小美 member            # 取消组长，恢复成普通组员
 
     :param argv: 命令行参数
     :return: 进程退出码
@@ -524,13 +590,39 @@ def _cli(argv: list[str]) -> int:
     action = (argv[0] if argv else "list").lower()
 
     if action == "list":
-        print(f"{'登录名':<10}{'显示名':<10}{'初始密码':<10}最近登录")
+        print(f"{'登录名':<10}{'显示名':<10}{'角色':<8}{'初始密码':<10}最近登录")
         for user in _database.list_users():
             name = user["username"]
-            print(f"{name:<10}{assignee_display(name) or name:<10}"
+            role = "组长" if (user.get("role") == ROLE_LEAD) else "组员"
+            print(f"{name:<10}{assignee_display(name) or name:<10}{role:<8}"
                   f"{'是 ⚠️' if is_default_password(name) else '否':<10}"
                   f"{user.get('last_login_at') or '从未'}")
         return 0
+
+    if action == "role":
+        if len(argv) < 3:
+            print("用法：python auth.py role <登录名> <lead|member>")
+            return 2
+        username = resolve_username(argv[1])
+        if not username:
+            print(f"❌ 找不到用户：{argv[1]}")
+            return 1
+        role = argv[2].strip().lower()
+        if role not in ROLES:
+            print(f"❌ 角色只能是 {' / '.join(ROLES)}")
+            return 1
+        if not _database.set_user_role(username, role):
+            print(f"❌ 设置失败：{username}")
+            return 1
+        _database.log_operation(username, "set_role", new_value=role, detail="命令行设置角色")
+        label = "组长" if role == ROLE_LEAD else "组员"
+        print(f"✅ {username}（{assignee_display(username) or username}）现在角色是：{label}")
+        if role == ROLE_LEAD:
+            print("   组长权限：人员视图可以把任意卡片拖给任何人；可以放行并合并 PR")
+        return 0
+
+    print(__doc__)
+    return 2
 
     if action == "reset":
         if len(argv) < 2:

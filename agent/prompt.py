@@ -98,6 +98,9 @@ REPORT_TEMPLATE = """## 🤖 Agent 代码审核报告
 # 通过 / 不通过时不同的行为说明，让提交者一眼看懂下一步
 PASSED_FOOTER = "\n> ✅ 已自动将 Issue 标记为 `done` 并关闭。\n"
 FAILED_FOOTER = "\n> ⏸️ Issue 状态保持不变，请按上面的建议修改后再次提交（提交信息里带上同一个 Issue 编号）。\n"
+# PR 场景（只审核不定案）：审核通过但先不标记完成，等 PR 合并到主干
+PASSED_PR_FOOTER = ("\n> ✅ 本次改动审核通过。这是 Pull Request 的提交，所以**先不标记完成**："
+                    "等这个 PR 合并到主干后，会自动把 Issue 标记为 `done` 并关闭。\n")
 
 
 def build_user_prompt(commit_message: str, issue_info: str, diff: str) -> str:

@@ -63,12 +63,14 @@ CREATE TABLE IF NOT EXISTS tasks (
 # 登录用户表
 # 说明：username 用「代号」（小明…），真实姓名只在本地 assignees.local.json 里，
 # 由界面层翻译，绝不写进数据库、更不会进 GitHub。
+# role：member = 普通组员（只能领取/推进自己的任务）；lead = 组长（可以给任何人分派、放行并合并 PR）
 _CREATE_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT UNIQUE NOT NULL,
     display_name  TEXT DEFAULT '',
     password_hash TEXT NOT NULL,
+    role          TEXT DEFAULT 'member',
     created_at    TEXT,
     last_login_at TEXT
 )
@@ -114,6 +116,13 @@ _COLUMN_MIGRATIONS: dict[str, str] = {
     "review_score": "INTEGER DEFAULT NULL",
     "review_passed": "INTEGER DEFAULT NULL",
     "review_comment": "TEXT DEFAULT ''",
+    # PR 相关（看板从卡片上建分支 / 提 PR / 组长放行与合并）
+    "pr_number": "INTEGER DEFAULT NULL",
+    "pr_state": "TEXT DEFAULT ''",      # '' / open / draft / merged / closed
+    "pr_url": "TEXT DEFAULT ''",
+    "pr_head": "TEXT DEFAULT ''",       # PR 的源分支
+    "pr_allowed": "INTEGER DEFAULT 0",  # 1 = 组长已放行，允许合并
+    "pr_allowed_by": "TEXT DEFAULT ''", # 放行的组长代号
 }
 
 # 常用索引
@@ -213,6 +222,22 @@ def _row_to_task(row: sqlite3.Row) -> dict[str, Any]:
     if not isinstance(task.get("review_comment"), str):
         task["review_comment"] = ""
 
+    # ---- PR：统一类型，前端好判断 ----
+    pr_number = task.get("pr_number")
+    if pr_number in (None, "", 0):
+        task["pr_number"] = None
+    else:
+        try:
+            task["pr_number"] = int(pr_number)
+        except (TypeError, ValueError):
+            task["pr_number"] = None
+    task["pr_state"] = task.get("pr_state") or ""
+    task["pr_url"] = task.get("pr_url") or ""
+    task["pr_head"] = task.get("pr_head") or ""
+    task["pr_allowed"] = bool(task.get("pr_allowed"))
+    task["pr_allowed_by"] = task.get("pr_allowed_by") or ""
+    task["has_pr"] = task["pr_number"] is not None
+
     return task
 
 
@@ -249,6 +274,17 @@ def init_db() -> None:
             "UPDATE tasks SET assignee_username = assignee "
             "WHERE COALESCE(assignee_username, '') = '' AND COALESCE(assignee, '') != ''"
         )
+
+        # ---- 用户表迁移：补 role 列（组长/组员）----
+        user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        if "role" not in user_columns:
+            logger.info("检测到旧用户表缺少 role 列，正在自动补齐（默认 member）")
+            try:
+                conn.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'member'")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        conn.execute("UPDATE users SET role = 'member' WHERE COALESCE(role, '') = ''")
 
         for sql in _CREATE_INDEX_SQL:
             try:
@@ -406,6 +442,7 @@ def create_user(
     username: str,
     password_hash: str,
     display_name: str = "",
+    role: str = "member",
 ) -> dict[str, Any]:
     """
     新建用户。
@@ -413,17 +450,32 @@ def create_user(
     :param username: 登录名（代号）
     :param password_hash: 已经哈希过的密码（**不要传明文**）
     :param display_name: 显示名；留空表示由本地真名映射表解析
+    :param role: 角色：member（组员）/ lead（组长）
     :return: 新用户字典
     """
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO users (username, display_name, password_hash, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (username, display_name, password_hash, now_iso()),
+            "INSERT INTO users (username, display_name, password_hash, role, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (username, display_name, password_hash, role or "member", now_iso()),
         )
     user = get_user(username)
     assert user is not None
     return user
+
+
+def set_user_role(username: str, role: str) -> bool:
+    """
+    设置用户角色（组长 / 组员）。
+
+    :param username: 登录名（代号）
+    :param role: member / lead
+    :return: 是否命中该用户
+    """
+    with get_conn() as conn:
+        cursor = conn.execute("UPDATE users SET role = ? WHERE username = ?",
+                              (role, username))
+        return cursor.rowcount > 0
 
 
 def set_user_password(username: str, password_hash: str) -> bool:
@@ -761,6 +813,46 @@ def update_task_meta(
             """,
             (branch, commits_json, now_iso(), issue_number),
         )
+
+
+def update_task_pr(issue_number: int, **fields: Any) -> bool:
+    """
+    更新卡片上的 PR 信息（只改传进来的字段）。
+
+    支持字段：``pr_number`` / ``pr_state`` / ``pr_url`` / ``pr_head`` /
+    ``pr_allowed`` / ``pr_allowed_by``。
+
+    :param issue_number: Issue 编号
+    :param fields: 要更新的字段（不传的保持原样）
+    :return: 是否命中了记录
+    """
+    allowed = ("pr_number", "pr_state", "pr_url", "pr_head", "pr_allowed", "pr_allowed_by")
+    updates: dict[str, Any] = {}
+    for key in allowed:
+        if key not in fields:
+            continue
+        value = fields[key]
+        if key == "pr_number":
+            value = None if value in (None, "") else int(value)
+        elif key == "pr_allowed":
+            value = 1 if value else 0
+        else:
+            value = "" if value is None else str(value)
+        updates[key] = value
+
+    if not updates:
+        return False
+
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    params: list[Any] = list(updates.values())
+    params.extend([now_iso(), issue_number])
+
+    with get_conn() as conn:
+        cursor = conn.execute(
+            f"UPDATE tasks SET {assignments}, updated_at = ? WHERE issue_number = ?",
+            params,
+        )
+        return cursor.rowcount > 0
 
 
 def delete_task(issue_number: int) -> bool:

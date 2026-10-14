@@ -160,7 +160,7 @@ def _handle_status(resp: requests.Response) -> bool:
                 hint = f"，约 {wait_min} 分钟后恢复"
             raise GitHubError(f"GitHub API 调用次数已用尽（403 限流）{hint}", 403)
         raise GitHubError(
-            "GitHub 拒绝访问（403）：Token 可能缺少 Issues/Contents 的读写权限，"
+            "GitHub 拒绝访问（403）：Token 可能缺少 Issues / Contents / Pull requests 的读写权限，"
             "或该仓库未被授权给此 Token",
             403,
         )
@@ -852,6 +852,184 @@ def find_branch_for_issue(issue_number: int, branches: list[str]) -> Optional[st
         if pattern.search(name):
             return name
     return None
+
+
+# ============================================================
+# 分支 / Pull Request
+# ============================================================
+def _repo_owner() -> str:
+    """当前仓库的 owner（PR 的 head 过滤需要 owner:branch 形式）。"""
+    return GITHUB_REPO.split("/", 1)[0] if "/" in GITHUB_REPO else ""
+
+
+def post_issue_comment(issue_number: int, body: str) -> dict[str, Any]:
+    """
+    在 Issue（或 PR，两者编号通用）下面发一条评论。
+
+    :param issue_number: Issue / PR 编号
+    :param body: 评论正文（Markdown）
+    :return: 评论对象
+    """
+    resp = _request("POST", f"/repos/{GITHUB_REPO}/issues/{issue_number}/comments",
+                    json_body={"body": body})
+    return resp.json()
+
+
+def get_branch_sha(branch: str) -> str:
+    """取某个分支当前指向的 commit SHA。"""
+    resp = _request("GET", f"/repos/{GITHUB_REPO}/git/ref/heads/{branch}")
+    return resp.json()["object"]["sha"]
+
+
+def create_branch(branch: str, from_branch: str = "main") -> dict[str, Any]:
+    """
+    从 from_branch 建一个新分支。
+
+    **幂等**：分支已存在时不报错，直接返回现有分支（看板上重复点「建分支」不会炸）。
+    GitHub 对「引用已存在」返回 422，而 422 在 _request 里会被统一抛成 GitHubError，
+    所以这里显式接住它、再确认一次分支确实存在。
+
+    :param branch: 新分支名
+    :param from_branch: 基于哪个分支，默认 main
+    :return: {"name", "created", "sha"}
+    """
+    name = (branch or "").strip()
+    if not name:
+        raise GitHubError("分支名不能为空", 400)
+    for bad in (" ", "..", "~", "^", ":", "?", "*", "\\", "//"):
+        if bad in name:
+            raise GitHubError(f"分支名不能包含 {bad!r}：{name}", 400)
+    if name.startswith(("/", ".", "-")) or name.endswith(("/", ".")):
+        raise GitHubError(f"分支名不合法：{name}", 400)
+
+    try:
+        resp = _request("POST", f"/repos/{GITHUB_REPO}/git/refs",
+                        json_body={"ref": f"refs/heads/{name}", "sha": get_branch_sha(from_branch)})
+    except GitHubError as exc:
+        if exc.status_code != 422:
+            raise
+        # 「引用已存在」→ 当成成功，把现有分支返回去
+        return {"name": name, "created": False, "sha": get_branch_sha(name)}
+
+    data = resp.json()
+    logger.info("已创建分支 %s（基于 %s）", name, from_branch)
+    return {"name": name, "created": True, "sha": (data.get("object") or {}).get("sha", "")}
+
+
+def normalize_pull_request(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    把 GitHub 的 PR 对象整理成看板用的字段。
+
+    state 取值：``open`` / ``draft`` / ``merged`` / ``closed``。
+    """
+    state = raw.get("state") or ""
+    if raw.get("merged") or raw.get("merged_at"):
+        state = "merged"
+    elif raw.get("draft") and state == "open":
+        state = "draft"
+    head = ((raw.get("head") or {}).get("ref")) or ""
+    return {
+        "number": raw.get("number"),
+        "state": state,
+        "title": raw.get("title") or "",
+        "url": raw.get("html_url") or "",
+        "head": head,
+        "base": ((raw.get("base") or {}).get("ref")) or "",
+        "merged": bool(raw.get("merged") or raw.get("merged_at")),
+        "mergeable": raw.get("mergeable"),
+        "draft": bool(raw.get("draft")),
+    }
+
+
+def find_pull_request_for_branch(branch: str) -> Optional[dict[str, Any]]:
+    """
+    找出某个分支对应的 PR（先查 open，再查全部）。
+
+    :param branch: 分支名
+    :return: 归一化后的 PR；没有时返回 None
+    """
+    owner = _repo_owner()
+    for state in ("open", "all"):
+        data = _paginate(f"/repos/{GITHUB_REPO}/pulls",
+                         params={"state": state, "head": f"{owner}:{branch}"}, max_pages=1)
+        if data:
+            return normalize_pull_request(data[0])
+    return None
+
+
+def create_pull_request(head: str, base: str = "main", title: str = "",
+                        body: str = "", draft: bool = False) -> dict[str, Any]:
+    """
+    提一个 Pull Request。
+
+    分支不存在、或分支相对 base 没有任何新提交时，GitHub 返回 422（会被统一抛成 GitHubError），
+    这里接住它：如果这个分支已经有 PR，就返回已有的那个；否则把原因说清楚。
+
+    :return: 归一化后的 PR（额外带 created 字段）
+    """
+    try:
+        resp = _request("POST", f"/repos/{GITHUB_REPO}/pulls", json_body={
+            "title": title or head, "head": head, "base": base, "body": body, "draft": draft,
+        })
+    except GitHubError as exc:
+        if exc.status_code != 422:
+            raise
+        existing = find_pull_request_for_branch(head)
+        if existing:
+            return dict(existing, created=False)
+        raise GitHubError(
+            f"无法创建 PR：{exc.message.split('：', 1)[-1] or '分支不存在，或它相对 base 还没有新提交'}",
+            422,
+        ) from exc
+
+    pr = normalize_pull_request(resp.json())
+    logger.info("已创建 PR #%s（%s → %s）", pr["number"], head, base)
+    return dict(pr, created=True)
+
+
+def get_pull_request(number: int) -> dict[str, Any]:
+    """取单个 PR 的最新状态。"""
+    return normalize_pull_request(
+        _request("GET", f"/repos/{GITHUB_REPO}/pulls/{number}").json())
+
+
+def list_pull_requests(state: str = "all", max_pages: int = 1) -> list[dict[str, Any]]:
+    """
+    列出 PR（同步时用来把 PR 状态映射回卡片）。
+
+    :param state: open / closed / all
+    :param max_pages: 最多翻页数（保护额度）
+    :return: 归一化后的 PR 列表
+    """
+    data = _paginate(f"/repos/{GITHUB_REPO}/pulls",
+                     params={"state": state, "sort": "updated", "direction": "desc"},
+                     max_pages=max_pages)
+    return [normalize_pull_request(item) for item in data]
+
+
+def merge_pull_request(number: int, method: str = "squash") -> dict[str, Any]:
+    """
+    合并 PR。
+
+    只有组长会走到这里（权限在 server 层校验）；合并方式默认 squash。
+
+    :raises GitHubError: 不可合并（冲突、检查未通过等）
+    """
+    if method not in ("merge", "squash", "rebase"):
+        method = "squash"
+    resp = _request("PUT", f"/repos/{GITHUB_REPO}/pulls/{number}/merge",
+                    json_body={"merge_method": method}, allow=(200, 405, 409))
+    if resp.status_code != 200:
+        try:
+            message = resp.json().get("message", "")
+        except ValueError:
+            message = resp.text[:160]
+        raise GitHubError(f"PR #{number} 合并失败：{message or '当前不可合并（可能有冲突或检查未通过）'}",
+                          resp.status_code)
+    data = resp.json()
+    logger.info("PR #%s 已合并（%s）", number, method)
+    return {"merged": bool(data.get("merged")), "message": data.get("message", ""),
+            "sha": data.get("sha", "")}
 
 
 def fetch_branch_commits(branch: str, limit: int = 20) -> list[dict[str, Any]]:

@@ -44,7 +44,9 @@ const TASKS = [
     {
         issue_number: 11, title: '完成点云配准模块', description: 'ICP 粗配准', status: 'todo',
         assignee: '小明', state: 'open', hidden: false, review_comment: '建议加空指针保护',
-        review_verdict: 'pass', review_score: 88, branch: '', commits: [],
+        review_verdict: 'pass', review_score: 88, branch: 'task/11-icp', commits: [],
+        pr_number: 12, pr_state: 'open', pr_url: 'https://example/pr/12',
+        pr_head: 'task/11-icp', pr_allowed: false, pr_allowed_by: '',
     },
     {
         issue_number: 12, title: '修复空指针崩溃', description: '配准里 null 判断', status: 'doing',
@@ -66,9 +68,12 @@ const json = (data) => Promise.resolve({
 });
 
 // 桩后端：状态可变，这样「全部恢复」才能真的反映到下一次列表请求上
-const state = { tasks: TASKS.map((t) => ({ ...t })), taskFetches: 0, writes: [] };
+const state = { tasks: TASKS.map((t) => ({ ...t })), taskFetches: 0, writes: [], isLead: false };
 
-const dom = new JSDOM(html, { runScripts: 'outside-only', url: 'http://127.0.0.1:5062/', pretendToBeVisual: true });
+// 用 dangerously + 注入 <script>：让 app.js 像在浏览器里那样以「经典脚本」执行，
+// 这样它的顶层函数才是真正的全局函数（app.js 里有 'use strict'，
+// 用 window.eval 的话函数会被关在 eval 自己的作用域里，测试就调不到 loadMe/render）。
+const dom = new JSDOM(html, { runScripts: 'dangerously', url: 'http://127.0.0.1:5062/', pretendToBeVisual: true });
 const { window } = dom;
 const { document } = window;
 
@@ -131,11 +136,19 @@ window.fetch = (url, options = {}) => {
     if (target.includes('/api/me')) {
         return json({ username: '小明', display_name: '张三', is_default_password: true,
             min_password_length: 6, done_requires_agent: true, done_is_final: true,
-            allow_assign_to_others: false });
+            is_lead: state.isLead, can_merge_pr: state.isLead,
+            allow_assign_to_others: state.isLead });
     }
     if (target.includes('/api/tasks/restore-all')) {
         state.tasks.forEach((t) => { t.hidden = false; });
         return json({ message: '已恢复全部任务' });
+    }
+    // PR 相关接口：只回消息，具体行为由断言检查请求
+    if (/\/pr(\/allow|\/merge)?$/.test(target)) {
+        return json({ message: 'PR 操作完成', pr_number: 12, allowed: true, merged: true });
+    }
+    if (/\/branch$/.test(target)) {
+        return json({ message: '已创建分支', branch: 'task/13-fix', created: true });
     }
     if (target.includes('/api/tasks')) {
         state.taskFetches += 1;
@@ -197,7 +210,10 @@ const press = (key) => input.dispatchEvent(new window.KeyboardEvent('keydown', {
 
 (async () => {
     // 在 window 里执行 app.js（等价于浏览器加载脚本）
-    window.eval(appJs);
+    // 把 app.js 作为真实脚本注入页面（等价于浏览器加载 <script src="...">）
+    const appScript = document.createElement('script');
+    appScript.textContent = appJs;
+    document.body.appendChild(appScript);
     await wait(300);   // 等 init() 里的几个 await 走完 + 搜索防抖 120ms
 
     check('脚本执行没有抛错', errors.length === 0, errors.join(' | '));
@@ -447,6 +463,104 @@ const press = (key) => input.dispatchEvent(new window.KeyboardEvent('keydown', {
 
     document.getElementById('view-status').click();
     await wait(60);
+
+    // —— 组长：可以给任何人分派（组员做不到）——
+    // 现状：我是 小明（组员），#12 是 小红 的
+    document.getElementById('view-assignee').click();
+    await wait(60);
+    const otherCard = document.querySelector('.card[data-issue="12"]');
+    check('组员看到的别人卡片是锁定的', otherCard !== null
+        && otherCard.classList.contains('card-locked'));
+
+    await wait(250);   // 等上一段（认领 #13）的异步写入彻底落定，避免污染计数
+    const writesBefore4 = state.writes.length;
+    dragCardTo(otherCard, document.querySelector('.column[data-key="小明"]'));
+    await wait(150);
+    check('组员把别人的任务拖给自己 → 被拒（不发请求）',
+        !state.writes.slice(writesBefore4).some((w) => /\/api\/tasks\/12/.test(w.url)),
+        JSON.stringify(state.writes.slice(writesBefore4)));
+
+    // 切成组长（重新拉一次 /api/me）
+    state.isLead = true;
+    await window.loadMe();
+    window.render();
+    await wait(60);
+    check('组长登录后用户名旁边带「组长」标记',
+        /组长/.test(document.getElementById('user-name').textContent),
+        document.getElementById('user-name').textContent);
+
+    const otherCardAsLead = document.querySelector('.card[data-issue="12"]');
+    check('组长看到的别人卡片不再锁定（可拖）', otherCardAsLead !== null
+        && !otherCardAsLead.classList.contains('card-locked')
+        && otherCardAsLead.draggable !== false);
+
+    const writesBefore5 = state.writes.length;
+    dragCardTo(otherCardAsLead, document.querySelector('.column[data-key="小明"]'));
+    await wait(150);
+    const leadAssign = state.writes.slice(writesBefore5)
+        .find((w) => w.method === 'PUT' && /\/api\/tasks\/12\/assignee$/.test(w.url));
+    check('组长把别人的任务分派给自己 → 发请求', leadAssign !== undefined,
+        JSON.stringify(state.writes.slice(writesBefore5)));
+    check('分派目标是组长选的（小明）',
+        leadAssign && leadAssign.body && leadAssign.body.assignee === '小明',
+        leadAssign ? JSON.stringify(leadAssign.body) : '没有请求');
+    check('提示语用的是「分派」',
+        /分派/.test(document.getElementById('status-bar').textContent),
+        document.getElementById('status-bar').textContent);
+
+    document.getElementById('view-status').click();
+    await wait(60);
+
+    // —— 卡片显示 PR + 分支 / PR 面板 ——
+    const prChip = document.querySelector('.card[data-issue="11"] .pr-chip');
+    check('有 PR 的卡片显示 PR 徽章', prChip !== null
+        && /PR #12/.test(prChip.textContent), prChip ? prChip.textContent : '没有徽章');
+    check('未放行时徽章写「待放行」', prChip !== null && /待放行/.test(prChip.textContent),
+        prChip ? prChip.textContent : '');
+    check('卡片上也有分支名',
+        /task\/11-icp/.test(document.querySelector('.card[data-issue="11"] .branch-chip')?.textContent || ''),
+        document.querySelector('.card[data-issue="11"] .branch-chip')?.textContent || '无');
+    check('没有 PR 的卡片不显示 PR 徽章',
+        document.querySelector('.card[data-issue="13"] .card-pr').hidden === true);
+
+    // 组长打开面板：允许/合并按钮可见，合并按钮要求先放行
+    document.querySelector('.card[data-issue="11"] .pr-btn').click();
+    await wait(40);
+    const prModal = document.getElementById('pr-modal');
+    check('PR 按钮能打开分支 / PR 面板', prModal.classList.contains('active'));
+    check('组长能看到「允许合并」按钮', document.getElementById('btn-pr-allow').hidden === false);
+    check('组长能看到「合并」按钮', document.getElementById('btn-pr-merge').hidden === false);
+    check('未放行时「合并」是禁用的', document.getElementById('btn-pr-merge').disabled === true);
+    check('面板里说明了要组长放行',
+        /组长/.test(document.getElementById('pr-status').textContent));
+    check('分支名已预填到输入框',
+        /task\/11-icp/.test(document.getElementById('pr-branch').value),
+        document.getElementById('pr-branch').value);
+
+    // 点「允许合并」→ 发请求
+    const writesBefore6 = state.writes.length;
+    document.getElementById('btn-pr-allow').click();
+    await wait(150);
+    check('点「允许合并」会调用 /pr/allow',
+        state.writes.slice(writesBefore6).some((w) => /\/api\/tasks\/11\/pr\/allow$/.test(w.url)),
+        JSON.stringify(state.writes.slice(writesBefore6)));
+
+    document.getElementById('btn-pr-close').click();
+    await wait(260);
+    check('面板可以关闭', !prModal.classList.contains('active'));
+
+    // 组员打开同一面板：看不到允许 / 合并
+    state.isLead = false;
+    await window.loadMe();
+    window.render();
+    await wait(60);
+    document.querySelector('.card[data-issue="11"] .pr-btn').click();
+    await wait(40);
+    check('组员看不到「允许合并」', document.getElementById('btn-pr-allow').hidden === true);
+    check('组员看不到「合并」', document.getElementById('btn-pr-merge').hidden === true);
+    check('组员面板里提示只有组长能做', /只有组长/.test(document.getElementById('pr-status').textContent));
+    document.getElementById('btn-pr-close').click();
+    await wait(260);
 
     // —— 已完成的任务：终态，界面上拖不动、也退不回上一列 ——
     const doneCard = document.querySelector('.card[data-issue="14"]');

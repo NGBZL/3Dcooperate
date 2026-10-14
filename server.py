@@ -34,6 +34,7 @@ Flask 后端服务
 from __future__ import annotations
 
 import logging
+import re
 import socket
 from typing import Any, Optional
 
@@ -53,6 +54,7 @@ from config import (
     DB_PATH,
     DEBUG,
     DEFAULT_ASSIGNEE,
+    DEFAULT_BRANCH,
     DONE_REQUIRES_AGENT,
     DONE_IS_FINAL,
     GITHUB_REPO,
@@ -60,6 +62,9 @@ from config import (
     HOST,
     MIN_PASSWORD_LENGTH,
     PORT,
+    PR_BODY_TEMPLATE,
+    PR_MERGE_METHOD,
+    PR_SYNC_BUDGET,
     SESSION_LIFETIME_HOURS,
     STATUSES,
     STATUS_LABELS,
@@ -352,13 +357,17 @@ def api_me():
         return fail("请先登录", 401)
 
     info = auth.user_public_info(user)
+    is_lead = auth.is_lead(user["username"])
     info.update({
         "min_password_length": MIN_PASSWORD_LENGTH,
         "done_requires_agent": DONE_REQUIRES_AGENT,
         # 前端据此决定「完成的任务能不能拖出去」
         "done_is_final": DONE_IS_FINAL,
-        # 前端据此决定「负责人」下拉框里能不能选别人
-        "allow_assign_to_others": ALLOW_ASSIGN_TO_OTHERS,
+        # 前端据此决定「负责人」下拉框 / 拖拽能不能选别人：
+        # 组长可以随便分派；组员按 ALLOW_ASSIGN_TO_OTHERS（默认只能领取）
+        "allow_assign_to_others": is_lead or ALLOW_ASSIGN_TO_OTHERS,
+        "is_lead": is_lead,
+        "can_merge_pr": is_lead,
     })
     return jsonify(info)
 
@@ -653,11 +662,12 @@ def create_task():
         if assignee_error:
             return fail(assignee_error, 400)
 
-    # 不允许「替别人建任务」：只能建给自己或放进未分配池
-    if assignee and assignee != _me() and not ALLOW_ASSIGN_TO_OTHERS:
+    # 不允许「替别人建任务」：只有组长（或显式放开 ALLOW_ASSIGN_TO_OTHERS）能直接派活
+    if (assignee and assignee != _me()
+            and not ALLOW_ASSIGN_TO_OTHERS and not auth.is_lead(_me())):
         return _deny(
             f"不能把新任务直接派给 {assignee_display(assignee)}："
-            f"只能建给自己的任务，或选「未分配」让本人认领",
+            f"只能建给自己的任务，或选「未分配」让本人认领（组长可以直接派）",
             "create_task",
         )
 
@@ -950,6 +960,209 @@ def restore_task(issue_number: int):
     return ok(message=f"已恢复 #{issue_number} 的显示", hidden_count=database.count_hidden())
 
 
+# ============================================================
+# 分支 / Pull Request
+# ============================================================
+def _branch_name_for(task: dict[str, Any]) -> str:
+    """
+    默认分支名：``task/<编号>-<英文 slug>``。
+
+    标题里的中文不往分支名里塞（URL / 命令行都不方便），只取 ASCII 字母数字；
+    取不到就退化成 ``task/<编号>``。
+
+    :param task: 任务字典
+    :return: 分支名
+    """
+    title = str(task.get("title") or "")
+    slug = re.sub(r"[^0-9A-Za-z]+", "-", title).strip("-").lower()[:24].strip("-")
+    return f"task/{task['issue_number']}-{slug}" if slug else f"task/{task['issue_number']}"
+
+
+def _task_for_pr(issue_number: int, action: str):
+    """
+    取任务并校验「建分支 / 提 PR」的权限：**任务负责人本人**或**组长**。
+
+    :return: (task, None) 或 (None, 错误响应)
+    """
+    task = database.get_task_by_issue(issue_number)
+    if not task:
+        return None, fail(f"本地不存在任务 #{issue_number}，请先执行同步", 404)
+
+    me = _me()
+    owner = task.get("assignee") or ""
+    if auth.is_lead(me) or (owner and owner == me):
+        return task, None
+
+    reason = (f"这是 {assignee_display(owner)} 的任务，只有负责人本人或组长能建分支 / 提 PR"
+              if owner else "这个任务还没有负责人：请先认领给自己，或让组长来操作")
+    return None, _deny(reason, action, issue_number)
+
+
+@app.route("/api/tasks/<int:issue_number>/branch", methods=["POST"])
+@auth.api_login_required
+def create_task_branch(issue_number: int):
+    """
+    给任务建一个分支（默认 ``task/<编号>-<slug>``，也可以在请求体里指定 name）。
+
+    请求体（都可选）：{"name": "task/12-fix", "from": "main"}
+
+    权限：任务负责人本人，或组长。
+    """
+    task, denied = _task_for_pr(issue_number, "create_branch")
+    if denied:
+        return denied
+    assert task is not None
+
+    data = _parse_json_body()
+    name = str(data.get("name") or "").strip() or _branch_name_for(task)
+    from_branch = str(data.get("from") or "").strip() or DEFAULT_BRANCH
+
+    try:
+        result = github_client.create_branch(name, from_branch)
+    except GitHubError as exc:
+        logger.error("给任务 #%s 建分支失败：%s", issue_number, exc.message)
+        database.log_operation(_me(), "create_branch", issue_number=issue_number,
+                               result="error", detail=exc.message)
+        return fail(exc.message, exc.status_code or 502)
+
+    database.update_task_meta(issue_number, branch=result["name"])
+    database.log_operation(_me(), "create_branch", issue_number=issue_number,
+                           new_value=result["name"])
+    realtime.notify_tasks_changed("create_branch", issue=issue_number, by=_me(),
+                                  detail=f"分支 {result['name']}")
+    return ok(branch=result["name"], created=result["created"], sha=result.get("sha", ""),
+              message=(f"已创建分支 {result['name']}（基于 {from_branch}）"
+                       if result["created"] else f"分支 {result['name']} 已存在，直接用它"))
+
+
+@app.route("/api/tasks/<int:issue_number>/pr", methods=["POST"])
+@auth.api_login_required
+def create_task_pr(issue_number: int):
+    """
+    给任务提一个 Pull Request。
+
+    请求体（都可选）：{"head": "task/12-fix", "base": "main", "title": "...", "draft": false}
+
+    不传 head 时用卡片上记录的分支（或默认分支名）。PR 正文里会自动写上 ``Closes #编号``，
+    这样**合并时 GitHub 会自动关闭 Issue**，看板同步后卡片才进 Done。
+
+    权限：任务负责人本人，或组长。
+    """
+    task, denied = _task_for_pr(issue_number, "create_pr")
+    if denied:
+        return denied
+    assert task is not None
+
+    data = _parse_json_body()
+    head = str(data.get("head") or task.get("branch") or "").strip() or _branch_name_for(task)
+    base = str(data.get("base") or "").strip() or DEFAULT_BRANCH
+    title = str(data.get("title") or "").strip() or f"{task.get('title')} (#{issue_number})"
+    body = str(data.get("body") or PR_BODY_TEMPLATE.format(issue=issue_number))
+
+    try:
+        pr = github_client.create_pull_request(head, base, title, body,
+                                               draft=bool(data.get("draft")))
+    except GitHubError as exc:
+        logger.error("给任务 #%s 提 PR 失败：%s", issue_number, exc.message)
+        database.log_operation(_me(), "create_pr", issue_number=issue_number,
+                               result="error", detail=exc.message)
+        return fail(exc.message, exc.status_code or 502)
+
+    database.update_task_pr(issue_number, pr_number=pr["number"], pr_state=pr["state"],
+                            pr_url=pr["url"], pr_head=pr.get("head") or head,
+                            pr_allowed=0, pr_allowed_by="")
+    database.update_task_meta(issue_number, branch=pr.get("head") or head)
+    database.log_operation(_me(), "create_pr", issue_number=issue_number,
+                           new_value=f"PR #{pr['number']} {pr.get('head')} → {pr.get('base')}")
+    realtime.notify_tasks_changed("create_pr", issue=issue_number, by=_me(),
+                                  detail=f"PR #{pr['number']}（{pr['state']}）")
+    return ok(pr=pr, message=(f"已提交 PR #{pr['number']}（合并后任务才会进 Done）"
+                              if pr.get("created", True)
+                              else f"这个分支已经有 PR #{pr['number']} 了"))
+
+
+@app.route("/api/tasks/<int:issue_number>/pr/allow", methods=["POST"])
+@auth.api_login_required
+def allow_task_pr(issue_number: int):
+    """
+    **组长放行 PR**：放行之后这个 PR 才允许被合并。
+
+    组员不能调用（403）；组长自己的 PR 也可以直接放行，规则只有一条：
+    合并前必须处于「已放行」状态。
+    """
+    message = auth.check_lead(_me())
+    if message:
+        return _deny(auth.lead_only_message("「放行 PR」"), "allow_pr", issue_number)
+
+    task = database.get_task_by_issue(issue_number)
+    if not task:
+        return fail(f"本地不存在任务 #{issue_number}，请先执行同步", 404)
+    pr_number = task.get("pr_number")
+    if not pr_number:
+        return fail(f"#{issue_number} 还没有 PR，先提一个", 400)
+
+    database.update_task_pr(issue_number, pr_allowed=1, pr_allowed_by=_me())
+    note = "已在 PR 下留言" 
+    try:
+        github_client.post_issue_comment(
+            int(pr_number),
+            f"✅ **组长已放行**（看板操作，任务 #{issue_number}）。可以合并了。",
+        )
+    except GitHubError as exc:
+        note = f"PR 留言失败（不影响放行）：{exc.message}"
+        logger.warning("放行 PR #%s 时留言失败：%s", pr_number, exc.message)
+
+    database.log_operation(_me(), "allow_pr", issue_number=issue_number,
+                           new_value=f"PR #{pr_number}")
+    realtime.notify_tasks_changed("allow_pr", issue=issue_number, by=_me(),
+                                  detail=f"已放行 PR #{pr_number}")
+    return ok(pr_number=pr_number, allowed=True,
+              message=f"已放行 PR #{pr_number}，现在可以合并了。（{note}）")
+
+
+@app.route("/api/tasks/<int:issue_number>/pr/merge", methods=["POST"])
+@auth.api_login_required
+def merge_task_pr(issue_number: int):
+    """
+    **组长合并 PR**（默认 squash）。
+
+    只有组长能调用；而且必须先「放行」。合并后 GitHub 会因为 PR 正文里的
+    ``Closes #编号`` 自动关闭 Issue，看板下次同步就把卡片放进 Done。
+    """
+    message = auth.check_lead(_me())
+    if message:
+        return _deny(auth.lead_only_message("合并 PR"), "merge_pr", issue_number)
+
+    task = database.get_task_by_issue(issue_number)
+    if not task:
+        return fail(f"本地不存在任务 #{issue_number}，请先执行同步", 404)
+    pr_number = task.get("pr_number")
+    if not pr_number:
+        return fail(f"#{issue_number} 还没有 PR", 400)
+    if not task.get("pr_allowed"):
+        return _deny("这个 PR 还没放行：请先点「允许」再合并", "merge_pr", issue_number)
+
+    data = _parse_json_body()
+    method = str(data.get("method") or PR_MERGE_METHOD).lower()
+
+    try:
+        result = github_client.merge_pull_request(int(pr_number), method)
+    except GitHubError as exc:
+        logger.error("合并 PR #%s 失败：%s", pr_number, exc.message)
+        database.log_operation(_me(), "merge_pr", issue_number=issue_number,
+                               result="error", detail=exc.message)
+        return fail(exc.message, exc.status_code or 502)
+
+    database.update_task_pr(issue_number, pr_state="merged")
+    database.log_operation(_me(), "merge_pr", issue_number=issue_number,
+                           new_value=f"PR #{pr_number}（{method}）")
+    realtime.notify_tasks_changed("merge_pr", issue=issue_number, by=_me(),
+                                  detail=f"已合并 PR #{pr_number}")
+    return ok(pr_number=pr_number, merged=True, sha=result.get("sha", ""),
+              message=(f"PR #{pr_number} 已合并（{method}）。"
+                       f"GitHub 会把 Issue 一并关闭，同步后卡片进 Done"))
+
+
 @app.route("/api/tasks/restore-all", methods=["POST"])
 @auth.api_login_required
 def restore_all_tasks():
@@ -970,6 +1183,58 @@ def restore_all_tasks():
 # ============================================================
 # 同步
 # ============================================================
+def _collect_pr_index() -> dict[str, dict[str, Any]]:
+    """
+    拉一份「分支 → PR」的索引（1 次分页请求）。
+
+    用途：别人直接在 GitHub 上提的 PR 也能被看板认领到卡片上，
+    不要求必须从看板点「提 PR」。
+
+    :return: {head 分支名: 归一化 PR}
+    """
+    index: dict[str, dict[str, Any]] = {}
+    try:
+        for pr in github_client.list_pull_requests(state="all", max_pages=1):
+            head = str(pr.get("head") or "")
+            if head:
+                # 同一分支有多个 PR 时，open 的优先（覆盖已合并/关闭的旧记录）
+                if head not in index or pr.get("state") in ("open", "draft"):
+                    index[head] = pr
+    except GitHubError as exc:
+        logger.warning("拉取 PR 列表失败（本次同步跳过 PR 认领）：%s", exc.message)
+    return index
+
+
+def _pr_snapshot(task_number: int, branch: str, local: Optional[dict[str, Any]],
+                 pr_index: dict[str, dict[str, Any]],
+                 budget: dict[str, int]) -> Optional[dict[str, Any]]:
+    """
+    算出这张卡片当前的 PR 状态。
+
+    * 卡片上已经记了 PR 编号 → 单独查一次它（拿最新的 merged / closed 状态）
+    * 否则用分支名去索引里认领（别人在 GitHub 上提的 PR）
+
+    :param budget: 共享的预算计数器 {"used": n}
+    :return: 归一化 PR；没有或超预算时返回 None
+    """
+    pr_number = (local or {}).get("pr_number")
+    if pr_number:
+        if budget["used"] >= PR_SYNC_BUDGET:
+            budget["hit"] = 1
+            return None
+        budget["used"] += 1
+        try:
+            return github_client.get_pull_request(int(pr_number))
+        except GitHubError as exc:
+            logger.warning("刷新 PR #%s 状态失败：%s", pr_number, exc.message)
+            return None
+
+    name = str(branch or (local or {}).get("branch") or "")
+    if name and name in pr_index:
+        return pr_index[name]
+    return None
+
+
 def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[str, Any]:
     """
     执行一次完整同步。
@@ -982,18 +1247,22 @@ def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[s
     issues = github_client.fetch_all_issues(state=SYNC_ISSUE_STATE, max_pages=SYNC_MAX_PAGES)
 
     collector: RepoMetaCollector | None = None
+    pr_index: dict[str, dict[str, Any]] = {}
     if with_meta and issues:
         collector = RepoMetaCollector(
             branch_commit_budget=SYNC_BRANCH_COMMIT_BUDGET,
             commits_per_task=COMMITS_PER_TASK,
         )
         collector.prepare()
+        pr_index = _collect_pr_index()
 
     created = updated = unchanged = 0
     assigned_count = 0
     reviewed_count = 0
+    pr_count = 0
     review_requests = 0
     review_budget_hit = False
+    pr_budget = {"used": 0, "hit": 0}
     changes: list[dict[str, Any]] = []
     valid_numbers: list[int] = []
 
@@ -1045,6 +1314,18 @@ def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[s
             except GitHubError as exc:  # 单个任务失败不应中断整体同步
                 logger.warning("收集任务 #%s 的分支/提交失败：%s", number, exc.message)
 
+        # ---- PR：卡片上已有 PR 就刷新它的状态；没有就用分支名认领一个 ----
+        pr = _pr_snapshot(number, meta.get("branch") or "", local, pr_index, pr_budget)
+        remote_pr: Optional[dict[str, Any]] = None
+        if pr and pr.get("number"):
+            remote_pr = {
+                "pr_number": pr["number"],
+                "pr_state": pr.get("state") or "",
+                "pr_url": pr.get("url") or "",
+                "pr_head": pr.get("head") or "",
+            }
+            pr_count += 1
+
         # 远端派生值（None 表示“这一次没有拿到/不修改”，不参与比较）
         remote: dict[str, Any] = {
             "title": issue.get("title") or f"Issue #{number}",
@@ -1070,6 +1351,8 @@ def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[s
                 review_comment=review.get("text") if review else None,
                 review_replace=bool(review),
             )
+            if remote_pr:
+                database.update_task_pr(number, **remote_pr)
             created += 1
             continue
 
@@ -1083,13 +1366,24 @@ def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[s
             if str(old_value) != str(new_value):
                 field_changes[field] = (str(old_value), str(new_value), label)
 
-        # 元信息 / 审核结果是否变化（不列进“用户可见变更”，但需要落库）
+        # 元信息 / 审核结果 / PR 是否变化（不列进“用户可见变更”，但需要落库）
         meta_changed = False
         if collector is not None:
             if (local.get("branch") or "") != (meta.get("branch") or ""):
                 meta_changed = True
             if (local.get("commits") or []) != (meta.get("commits") or []):
                 meta_changed = True
+        if remote_pr:
+            if (local.get("pr_number") != remote_pr["pr_number"]
+                    or (local.get("pr_state") or "") != remote_pr["pr_state"]
+                    or (local.get("pr_url") or "") != remote_pr["pr_url"]
+                    or (local.get("pr_head") or "") != remote_pr["pr_head"]):
+                meta_changed = True
+                # PR 状态变化对用户是有意义的，放进「被 GitHub 更新的卡片」里说清楚
+                if (local.get("pr_number") and local.get("pr_state")
+                        and local.get("pr_state") != remote_pr["pr_state"]):
+                    field_changes["pr_state"] = (str(local.get("pr_state")),
+                                                 str(remote_pr["pr_state"]), "PR 状态")
         if review is not None:
             if (local.get("review_score") != review.get("score")
                     or local.get("review_passed") != review.get("passed")
@@ -1119,6 +1413,8 @@ def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[s
             review_comment=review.get("text") if review else None,
             review_replace=bool(review),
         )
+        if remote_pr:
+            database.update_task_pr(number, **remote_pr)
         updated += 1
 
         if field_changes:
@@ -1140,6 +1436,10 @@ def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[s
 
     removed = database.delete_missing_issues(valid_numbers) if prune else 0
 
+    if pr_budget["hit"]:
+        logger.warning("本次同步已达 PR 状态刷新预算（%d 个），其余卡片本轮不刷新 PR",
+                       PR_SYNC_BUDGET)
+
     return {
         "total": len(valid_numbers),
         "created": created,
@@ -1149,6 +1449,7 @@ def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[s
         "assigned": assigned_count,
         "reviewed": reviewed_count,
         "review_requests": review_requests,
+        "prs": pr_count,
         "changes": changes,
         "with_meta": with_meta,
         "with_reviews": with_reviews,
@@ -1192,7 +1493,7 @@ def sync():
         f"同步完成：共 {stats['total']} 个任务"
         f"（新增 {stats['created']}，更新 {stats['updated']}，"
         f"未变化 {stats['unchanged']}，已分配 {stats['assigned']}，"
-        f"已审核 {stats['reviewed']}，清理 {stats['removed']}）"
+        f"已审核 {stats['reviewed']}，关联 PR {stats.get('prs', 0)}，清理 {stats['removed']}）"
     )
 
     # 把「哪些卡片被远端改了」说清楚：不再让本地改动看起来“莫名其妙被改回去”

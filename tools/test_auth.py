@@ -341,6 +341,92 @@ check("无法确认归属：宁可从 GitHub 重拉（清空）",
       unknown["changed"] is True and unknown["cleared"] == 1, unknown)
 
 print()
+print("[10] 组长 vs 组员：分派权限")
+print("=" * 68)
+# 造一个组长账号（用第三个代号，避免和 ME/OTHER 冲突）
+LEAD = "小刚"
+LEAD_NAME = assignee_display(LEAD) or LEAD
+database.set_user_role(ME, "member")
+database.set_user_role(LEAD, "lead")
+
+lead_client = server.app.test_client()
+lead_client.post("/login", data={"username": LEAD_NAME, "password": "123456"})
+
+database.upsert_task(901, "组员的任务", "", "todo", assignee=ME)
+database.upsert_task(902, "组长的任务", "", "todo", assignee=LEAD)
+
+check("组员自己：/api/me 的 allow_assign_to_others=False",
+      client.get("/api/me").get_json()["allow_assign_to_others"] is False)
+check("组长：/api/me 的 allow_assign_to_others=True",
+      lead_client.get("/api/me").get_json()["allow_assign_to_others"] is True)
+check("组长：is_lead / can_merge_pr 都是 True",
+      lead_client.get("/api/me").get_json()["is_lead"] is True
+      and lead_client.get("/api/me").get_json()["can_merge_pr"] is True)
+
+check("组员把别人的任务派给别人 → 403",
+      client.put("/api/tasks/902/assignee", json={"assignee": OTHER}).status_code == 403)
+check("组长把别人的任务派给第三人 → 200",
+      lead_client.put("/api/tasks/901/assignee", json={"assignee": OTHER}).status_code == 200)
+check("派完之后负责人确实变了", database.get_task_by_issue(901)["assignee"] == OTHER)
+check("组长可以把任务收回给自己 → 200",
+      lead_client.put("/api/tasks/901/assignee", json={"assignee": LEAD}).status_code == 200)
+check("组长可以推进别人的状态 → 200",
+      lead_client.put("/api/tasks/901", json={"status": "doing"}).status_code == 200)
+check("组长可以替别人建任务（直接派活）→ 201",
+      lead_client.post("/api/tasks", json={"title": "组长派的活", "assignee": ME}).status_code == 201)
+check("组员替别人建任务仍然 → 403",
+      client.post("/api/tasks", json={"title": "x", "assignee": OTHER}).status_code == 403)
+check("组长拿到的卡片 can_edit 全为真（任何卡片都能拖）",
+      all(t.get("can_edit") for t in lead_client.get("/api/tasks").get_json()
+          if t["issue_number"] in (901, 902)))
+check("组员仍然不能推进别人的任务 → 403",
+      client.put("/api/tasks/902", json={"status": "doing"}).status_code == 403)
+
+print()
+print("[11] 分支 / PR：谁能做、组长放行与合并")
+print("=" * 68)
+github_client.create_branch = lambda branch, from_branch="main": {
+    "name": branch, "created": True, "sha": "0" * 40}
+github_client.create_pull_request = lambda head, base="main", title="", body="", draft=False: {
+    "number": 77, "state": "open", "title": title, "url": "https://example/pr/77",
+    "head": head, "base": base, "merged": False, "draft": False, "created": True}
+github_client.post_issue_comment = lambda number, body: {"id": 1}
+github_client.merge_pull_request = lambda number, method="squash": {
+    "merged": True, "message": "Pull Request successfully merged", "sha": "abc"}
+
+database.upsert_task(903, "带 PR 的任务", "", "doing", assignee=ME)
+database.upsert_task(904, "别人的 PR 任务", "", "doing", assignee=OTHER)
+
+check("组员给自己的任务建分支 → 200",
+      client.post("/api/tasks/903/branch", json={"name": "task/903-fix"}).status_code == 200)
+check("分支记到了卡片上", database.get_task_by_issue(903)["branch"] == "task/903-fix")
+check("组员给别人的任务建分支 → 403",
+      client.post("/api/tasks/904/branch", json={}).status_code == 403)
+check("组长给别人的任务建分支 → 200",
+      lead_client.post("/api/tasks/904/branch", json={}).status_code == 200)
+
+check("组员给自己的任务提 PR → 200",
+      client.post("/api/tasks/903/pr", json={"head": "task/903-fix"}).status_code == 200)
+pr_task = database.get_task_by_issue(903)
+check("PR 编号/状态记到了卡片上",
+      pr_task["pr_number"] == 77 and pr_task["pr_state"] == "open", pr_task["pr_state"])
+check("新 PR 默认「未放行」", pr_task["pr_allowed"] is False)
+check("组员不能合并 → 403",
+      client.post("/api/tasks/903/pr/merge", json={}).status_code == 403)
+check("组员也不能放行 → 403",
+      client.post("/api/tasks/903/pr/allow", json={}).status_code == 403)
+check("组长没放行就合并 → 403（必须先放行）",
+      lead_client.post("/api/tasks/903/pr/merge", json={}).status_code == 403)
+check("组长放行 → 200", lead_client.post("/api/tasks/903/pr/allow", json={}).status_code == 200)
+check("放行状态记下来了，且记了是谁放的",
+      database.get_task_by_issue(903)["pr_allowed"] is True
+      and database.get_task_by_issue(903)["pr_allowed_by"] == LEAD)
+check("放行后组长合并 → 200",
+      lead_client.post("/api/tasks/903/pr/merge", json={}).status_code == 200)
+check("合并后 PR 状态是 merged",
+      database.get_task_by_issue(903)["pr_state"] == "merged")
+
+print()
 print("=" * 68)
 print("清理测试数据")
 shutil.rmtree(WORKDIR, ignore_errors=True)

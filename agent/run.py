@@ -177,6 +177,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="忽略“同一提交已审核过”的判断，强制重新评论",
     )
     parser.add_argument(
+        "--no-close",
+        action="store_true",
+        default=env_bool("AGENT_NO_CLOSE"),
+        help="只审核不定案：照发评语，但不打 done 标签、不关闭 Issue"
+             "（PR 场景用；也可用 AGENT_NO_CLOSE=1 打开）",
+    )
+    parser.add_argument(
         "--log-level",
         default=env("AGENT_LOG_LEVEL", "INFO"),
         help="日志级别：DEBUG / INFO / WARNING（默认 INFO）",
@@ -207,9 +214,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         _write_step_summary("## ❌ Agent 审核失败\n\n缺少本次提交 SHA（COMMIT_SHA / --after）\n")
         return 2
 
+    # PR 事件：只审核不定案（等合并到主干后由 push 那一轮再关闭 Issue）
+    # 显式用 --no-close 或 AGENT_NO_CLOSE=1，或 Actions 里 EVENT_NAME=pull_request 都会生效
+    allow_close = not (args.no_close or env("EVENT_NAME") == "pull_request")
+
     logger.info("GitHub Token：%s", mask_secret(github_token()))
     logger.info("仓库：%s", args.repo or github_repo() or "(未配置)")
     logger.info("审核范围：%s ... %s", (before_sha or "(新分支)")[:7], after_sha[:7])
+    logger.info("事件：%s（%s）", env("EVENT_NAME") or "unknown",
+                "只审核不定案，合并后才进 Done" if not allow_close else "过审即定案")
 
     # ---- 初始化（配置错误要给出明确提示，而不是抛栈） ----
     try:
@@ -225,7 +238,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # ---- 执行审核 ----
     try:
-        result = reviewer.review(before_sha, after_sha, dry_run=args.dry_run, force=args.force)
+        result = reviewer.review(before_sha, after_sha, dry_run=args.dry_run,
+                                 force=args.force, allow_close=allow_close)
     except ReviewError as exc:
         logger.error("审核失败：%s", exc.message)
         _write_step_summary(f"## ❌ Agent 审核失败\n\n{exc.message}\n")

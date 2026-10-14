@@ -1271,6 +1271,129 @@ code {
     border-left-color: hsl(var(--hue, 265) 26% 76%);
 }
 
+/* ---- PR 徽章：卡片上显示 PR 编号与状态 ---- */
+.card-pr {
+    margin-top: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+/* display:flex 会覆盖 [hidden]，必须显式声明 */
+.card-pr[hidden] {
+    display: none;
+}
+
+.pr-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    align-self: flex-start;
+    max-width: 100%;
+    padding: 2px 9px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.7;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+
+/* 徽章前的小圆点，颜色表示状态 */
+.pr-chip::before {
+    content: "";
+    flex: none;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+.pr-chip.pr-open {
+    background: var(--doing-bg);
+    color: var(--doing-ink);
+    border-color: #d5e7e6;
+}
+
+.pr-chip.pr-draft {
+    background: #f1f2f4;
+    color: var(--text-soft);
+    border-color: #e0e2e6;
+}
+
+.pr-chip.pr-allowed {
+    background: var(--accent-soft);
+    color: var(--accent-deep);
+    border-color: var(--accent-line);
+}
+
+.pr-chip.pr-merged {
+    background: var(--done-bg);
+    color: var(--done-ink);
+    border-color: #d8e6dd;
+}
+
+.pr-chip.pr-closed {
+    background: var(--danger-bg);
+    color: var(--danger-ink);
+    border-color: #e8d3d4;
+}
+
+.pr-chip:hover {
+    box-shadow: 0 1px 4px rgba(28, 34, 40, .12);
+}
+
+/* 「PR」按钮：没 PR 时也看得见，提示这里可以开 PR */
+.icon-btn.pr-btn {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .3px;
+    padding: 3px 7px;
+    margin-right: 2px;
+    border: 1px solid var(--line);
+}
+
+/* 分支 / PR 面板里的状态说明 */
+.pr-status {
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: #f7f8f9;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    line-height: 1.9;
+    color: var(--text-soft);
+    word-break: break-all;
+}
+
+.pr-status code {
+    background: #eceef0;
+    color: var(--text);
+}
+
+.modal-tip-line {
+    margin: 2px 0 0;
+    font-size: 12px;
+    color: var(--text-soft);
+    word-break: break-word;
+}
+
+.pr-actions {
+    flex-wrap: wrap;
+    row-gap: 8px;
+}
+
+/* 组长标记：用户名旁边那一小截 */
+.user-chip-lead {
+    border-color: var(--accent-line);
+    background: var(--accent-soft);
+    color: var(--accent-deep);
+}
+
 /* 分支 / 提交信息 */
 .card-meta {
     margin-top: 8px;
