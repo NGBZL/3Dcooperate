@@ -147,6 +147,15 @@ window.fetch = (url, options = {}) => {
     if (/\/pr(\/allow|\/merge)?$/.test(target)) {
         return json({ message: 'PR 操作完成', pr_number: 12, allowed: true, merged: true });
     }
+    if (/\/code$/.test(target)) {
+        return json({ message: '已提交 1 个文件到 task/11-icp（abc1234）', branch: 'task/11-icp',
+            commit: 'abcdef1234567890', pr_number: 13, pr_state: 'open',
+            pr_url: 'https://example/pr/13' });
+    }
+    if (/\/file\?/.test(target)) {
+        return json({ exists: true, path: 'recon/knn.py', ref: 'main',
+            content: 'print("from repo")\n', message: '已从 main 读入 recon/knn.py' });
+    }
     if (/\/branch$/.test(target)) {
         return json({ message: '已创建分支', branch: 'task/13-fix', created: true });
     }
@@ -588,6 +597,95 @@ const press = (key) => input.dispatchEvent(new window.KeyboardEvent('keydown', {
     check('组员面板里提示只有组长能做', /只有组长/.test(document.getElementById('pr-status').textContent));
     document.getElementById('btn-pr-close').click();
     await wait(260);
+
+    // —— 卡片上的纯文本编辑器：直接提交代码 ——
+    const codeBtn = document.querySelector('.card[data-issue="11"] .code-btn');
+    check('卡片上有「代码」按钮', codeBtn !== null);
+    // 先把上一轮可能残留的草稿清掉，保证从空开始
+    window.localStorage.removeItem('kanban.codeDraft.11');
+    codeBtn.click();
+    await wait(60);
+    const codeModal = document.getElementById('code-modal');
+    check('「代码」按钮能打开编辑器', codeModal.classList.contains('active'));
+    check('编辑器里有一个文件条目',
+        document.querySelectorAll('#code-file-list .code-file-item').length === 1);
+    check('提交信息默认带上了 Issue 编号',
+        /#11/.test(document.getElementById('code-message').value),
+        document.getElementById('code-message').value);
+
+    // 填路径 + 粘代码
+    const pathInput = document.getElementById('code-path');
+    const contentArea = document.getElementById('code-content');
+    pathInput.value = 'recon/knn.py';
+    pathInput.dispatchEvent(new window.Event('input', { bubbles: true }));
+    contentArea.value = 'def knn(x):\n    return x + 1\n';
+    contentArea.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await wait(60);
+    check('内容大小提示会更新',
+        /当前文件/.test(document.getElementById('code-size-tip').textContent),
+        document.getElementById('code-size-tip').textContent);
+
+    // 再加一个文件
+    document.getElementById('btn-code-add').click();
+    await wait(40);
+    check('「+」能加出第二个文件条目',
+        document.querySelectorAll('#code-file-list .code-file-item').length === 2,
+        String(document.querySelectorAll('#code-file-list .code-file-item').length));
+    document.getElementById('code-path').value = 'README.md';
+    document.getElementById('code-path').dispatchEvent(new window.Event('input', { bubbles: true }));
+    document.getElementById('code-content').value = '# 说明\n';
+    document.getElementById('code-content').dispatchEvent(new window.Event('input', { bubbles: true }));
+    await wait(60);
+
+    // 删除第二个文件（README.md），保留 recon/knn.py
+    const rows = document.querySelectorAll('#code-file-list .code-file-item');
+    rows[1].querySelector('.code-file-del').click();
+    await wait(60);
+    check('文件条目可以删掉',
+        document.querySelectorAll('#code-file-list .code-file-item').length === 1,
+        String(document.querySelectorAll('#code-file-list .code-file-item').length));
+    check('删掉的是第二个文件，第一个还在',
+        /knn/.test(document.querySelector('#code-file-list .code-file-item').textContent),
+        document.querySelector('#code-file-list .code-file-item').textContent);
+
+    // 草稿会存进 localStorage
+    const draftRaw = window.localStorage.getItem('kanban.codeDraft.11');
+    check('草稿已存进 localStorage', Boolean(draftRaw), String(draftRaw).slice(0, 60));
+    check('草稿里有刚粘的内容', Boolean(draftRaw) && draftRaw.includes('def knn(x)'),
+        String(draftRaw).slice(0, 120));
+
+    // 关掉再打开：内容还在
+    document.getElementById('btn-code-cancel').click();
+    await wait(260);
+    check('编辑器可以关闭', !codeModal.classList.contains('active'));
+    document.querySelector('.card[data-issue="11"] .code-btn').click();
+    await wait(60);
+    check('重新打开后草稿还在（内容不丢）',
+        document.getElementById('code-content').value.includes('def knn(x)'),
+        document.getElementById('code-content').value.slice(0, 40));
+
+    // 提交
+    const writesBefore8 = state.writes.length;
+    document.getElementById('btn-code-submit').click();
+    await wait(250);
+    const codeWrite = state.writes.slice(writesBefore8)
+        .find((w) => w.method === 'POST' && /\/api\/tasks\/11\/code$/.test(w.url));
+    check('点「提交到分支」会调用 /api/tasks/11/code', codeWrite !== undefined,
+        JSON.stringify(state.writes.slice(writesBefore8).map((w) => w.url)));
+    check('提交体里有文件与提交信息',
+        codeWrite && codeWrite.body && Array.isArray(codeWrite.body.files)
+        && codeWrite.body.files[0].path === 'recon/knn.py'
+        && codeWrite.body.files[0].content.includes('def knn(x)')
+        && /#11/.test(codeWrite.body.message),
+        codeWrite ? JSON.stringify(codeWrite.body).slice(0, 160) : '没有请求');
+    check('提交体里带上了「自动提 PR」开关',
+        codeWrite && codeWrite.body && codeWrite.body.open_pr === true);
+    check('提交成功后编辑器自动关闭', !codeModal.classList.contains('active'));
+    check('提交成功后草稿被清掉',
+        window.localStorage.getItem('kanban.codeDraft.11') === null);
+    check('状态条提示提交成功',
+        /已提交/.test(document.getElementById('status-bar').textContent),
+        document.getElementById('status-bar').textContent);
 
     // —— 已完成的任务：终态，界面上拖不动、也退不回上一列 ——
     const doneCard = document.querySelector('.card[data-issue="14"]');

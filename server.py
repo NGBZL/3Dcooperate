@@ -50,6 +50,8 @@ from config import (
     ALLOW_ASSIGN_TO_OTHERS,
     ASSIGNEES,
     ASSIGNEE_ALIASES_PATH,
+    CODE_MAX_FILE_BYTES,
+    CODE_MAX_TOTAL_BYTES,
     COMMITS_PER_TASK,
     DB_PATH,
     DEBUG,
@@ -980,7 +982,7 @@ def _branch_name_for(task: dict[str, Any]) -> str:
 
 def _task_for_pr(issue_number: int, action: str):
     """
-    取任务并校验「建分支 / 提 PR」的权限：**任务负责人本人**或**组长**。
+    取任务并校验「建分支 / 提 PR / 提交代码」的权限：**任务负责人本人**或**组长**。
 
     :return: (task, None) 或 (None, 错误响应)
     """
@@ -993,9 +995,187 @@ def _task_for_pr(issue_number: int, action: str):
     if auth.is_lead(me) or (owner and owner == me):
         return task, None
 
-    reason = (f"这是 {assignee_display(owner)} 的任务，只有负责人本人或组长能建分支 / 提 PR"
+    reason = (f"这是 {assignee_display(owner)} 的任务，只有负责人本人或组长能改它的代码"
               if owner else "这个任务还没有负责人：请先认领给自己，或让组长来操作")
     return None, _deny(reason, action, issue_number)
+
+
+def _clean_repo_path(raw: str) -> str:
+    """
+    校验并规整仓库内路径（防止 ``../`` 之类跑到仓库外面去）。
+
+    :param raw: 用户输入的路径
+    :return: 规整后的路径
+    :raises ValueError: 路径非法
+    """
+    path = str(raw or "").strip().replace("\\", "/")
+    if not path:
+        raise ValueError("文件路径不能为空")
+    if path.startswith("/") or path.startswith("../") or "/../" in path or path.endswith("/.."):
+        raise ValueError(f"文件路径不能是绝对路径，也不能包含 ..：{raw}")
+    if path.startswith(".") and "/" not in path:
+        raise ValueError(f"文件路径不能以点开头：{raw}")
+    if "//" in path:
+        path = path.replace("//", "/")
+    if len(path) > 240:
+        raise ValueError("文件路径太长了")
+    return path
+
+
+@app.route("/api/tasks/<int:issue_number>/file", methods=["GET"])
+@auth.api_login_required
+def get_task_file(issue_number: int):
+    """
+    把仓库里的一个文件读出来，灌进卡片的编辑器（改现有文件时用）。
+
+    :query path: 仓库内路径，如 ``recon/knn.py``（必填）
+    :query ref: 从哪个分支/提交读；留空则优先任务分支，其次主干
+
+    权限：任何登录用户都能读（仓库本来就是大家的工作区）。
+    """
+    task = database.get_task_by_issue(issue_number)
+    if not task:
+        return fail(f"本地不存在任务 #{issue_number}，请先执行同步", 404)
+
+    try:
+        path = _clean_repo_path(request.args.get("path", ""))
+    except ValueError as exc:
+        return fail(str(exc), 400)
+
+    ref = str(request.args.get("ref") or "").strip() or task.get("branch") or DEFAULT_BRANCH
+    try:
+        found = github_client.get_file_content(path, ref)
+    except GitHubError as exc:
+        return fail(exc.message, exc.status_code or 502)
+
+    if found is None:
+        return ok(exists=False, path=path, ref=ref, content="",
+                  message=f"{ref} 上没有 {path}（可以当新文件写）")
+
+    return ok(exists=True, path=found["path"], ref=ref,
+              content=found["content"], size=found.get("size", 0),
+              message=f"已从 {ref} 读入 {path}（{found.get('size', 0)} 字节）")
+
+
+@app.route("/api/tasks/<int:issue_number>/code", methods=["POST"])
+@auth.api_login_required
+def commit_task_code(issue_number: int):
+    """
+    **在卡片上直接提交代码**（纯文本编辑器 → 一个 commit 推到任务分支）。
+
+    请求体::
+
+        {
+          "files": [{"path": "recon/knn.py", "content": "...源码..."}, ...],
+          "message": "feat: 实现 KNN 匹配",     # 可省略，省略时自动生成
+          "branch": "task/2-knn",              # 可省略，省略时用任务分支
+          "open_pr": true                      # 提交后自动提 PR（默认 true）
+        }
+
+    权限：任务负责人本人，或组长。
+
+    * 分支不存在会自动从主干创建；
+    * 提交信息里会自动带上 ``(#Issue编号)``，这样 Agent 才会审核这次提交；
+    * 文件大小与数量有上限（见 ``CODE_MAX_FILE_BYTES`` / ``CODE_MAX_TOTAL_BYTES``），
+      避免误贴二进制大文件。
+    """
+    task, denied = _task_for_pr(issue_number, "commit_code")
+    if denied:
+        return denied
+    assert task is not None
+
+    data = _parse_json_body()
+    raw_files = data.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        return fail("没有要提交的文件：请在编辑器里至少写一个文件", 400)
+
+    me = _me()
+    files: list[dict[str, str]] = []
+    total = 0
+    seen: set[str] = set()
+    for item in raw_files:
+        if not isinstance(item, dict):
+            return fail("files 里每一项都要是 {path, content}", 400)
+        try:
+            path = _clean_repo_path(item.get("path", ""))
+        except ValueError as exc:
+            return fail(str(exc), 400)
+        if path in seen:
+            return fail(f"有两个文件都叫 {path}，请改掉其中一个", 400)
+        seen.add(path)
+
+        content = item.get("content")
+        if content is None:
+            content = ""
+        if not isinstance(content, str):
+            return fail(f"{path} 的内容必须是文本", 400)
+        if content.strip() == "":
+            return fail(f"{path} 的内容是空的（空文件请先在本地建好再随便写一行注释）", 400)
+
+        size = len(content.encode("utf-8"))
+        if size > CODE_MAX_FILE_BYTES:
+            return fail(f"{path} 太大了（{size} 字节，单个文件上限 {CODE_MAX_FILE_BYTES}）", 400)
+        total += size
+        if total > CODE_MAX_TOTAL_BYTES:
+            return fail(f"这次提交的总大小超过上限（{CODE_MAX_TOTAL_BYTES} 字节）", 400)
+        files.append({"path": path, "content": content})
+
+    branch = str(data.get("branch") or "").strip() or task.get("branch") or _branch_name_for(task)
+    base = str(data.get("base") or "").strip() or DEFAULT_BRANCH
+
+    # 提交信息：自动补上 Issue 编号，否则 Agent 不会审核这次提交
+    message = str(data.get("message") or "").strip()
+    if not message:
+        title = str(task.get("title") or "").strip() or f"任务 {issue_number}"
+        message = f"feat: {title} (#{issue_number})"
+    elif f"#{issue_number}" not in message:
+        message = f"{message} (#{issue_number})"
+
+    try:
+        result = github_client.commit_files(branch, files, message, create_from=base)
+    except GitHubError as exc:
+        logger.error("给任务 #%s 提交代码失败：%s", issue_number, exc.message)
+        database.log_operation(me, "commit_code", issue_number=issue_number,
+                               result="error", detail=exc.message)
+        return fail(exc.message, exc.status_code or 502)
+
+    database.update_task_meta(issue_number, branch=branch)
+    file_list = "、".join(item["path"] for item in files)
+    database.log_operation(me, "commit_code", issue_number=issue_number, new_value=branch,
+                           detail=f"{len(files)} 个文件：{file_list}；commit {result['commit'][:7]}")
+
+    # 需要的话顺手提 PR（PR 的 synchronize 事件会触发 Agent 审核）
+    pr_info: dict[str, Any] = {}
+    open_pr = data.get("open_pr")
+    open_pr = True if open_pr is None else bool(open_pr)
+    if open_pr and not task.get("pr_number"):
+        try:
+            pr = github_client.create_pull_request(
+                branch, base, f"{task.get('title')} (#{issue_number})",
+                PR_BODY_TEMPLATE.format(issue=issue_number))
+            database.update_task_pr(issue_number, pr_number=pr["number"], pr_state=pr["state"],
+                                    pr_url=pr["url"], pr_head=pr.get("head") or branch,
+                                    pr_allowed=0, pr_allowed_by="")
+            pr_info = {"pr_number": pr["number"], "pr_state": pr["state"], "pr_url": pr["url"]}
+            database.log_operation(me, "create_pr", issue_number=issue_number,
+                                   new_value=f"PR #{pr['number']} {branch}")
+        except GitHubError as exc:
+            # 提交已经成功了，PR 失败只是少了一步，提示用户去点「提 PR」
+            logger.warning("提交成功后自动提 PR 失败：%s", exc.message)
+            pr_info = {"error": exc.message}
+
+    realtime.notify_tasks_changed("commit_code", issue=issue_number, by=me,
+                                  detail=f"提交了 {len(files)} 个文件到 {branch}")
+
+    tail = ""
+    if pr_info.get("pr_number"):
+        tail = f"，并自动提了 PR #{pr_info['pr_number']}（Agent 会自动审核）"
+    elif pr_info.get("error"):
+        tail = f"；自动提 PR 失败（{pr_info['error']}），可以在 PR 面板里手动点「提 PR」"
+
+    return ok(branch=branch, commit=result["commit"], commit_url=result.get("url", ""),
+              files=result["files"], commit_message=message, **pr_info,
+              message=f"已提交 {len(files)} 个文件到 {branch}（{result['commit'][:7]}）{tail}")
 
 
 @app.route("/api/tasks/<int:issue_number>/branch", methods=["POST"])

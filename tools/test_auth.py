@@ -514,6 +514,88 @@ check("开着 + 没标签 → todo",
       github_client.status_from_labels({"state": "open", "labels": []}) == "todo")
 
 print()
+print("[15] 卡片上直接提交代码（纯文本编辑器）")
+print("=" * 68)
+commit_calls: list[dict] = []
+github_client.commit_files = lambda branch, files, message, create_from="": (
+    commit_calls.append({"branch": branch, "files": files, "message": message,
+                         "create_from": create_from})
+    or {"commit": "d" * 40, "url": "https://example.test/commit/" + "d" * 40,
+        "branch": branch, "files": [f["path"] for f in files], "message": message}
+)
+github_client.get_file_content = lambda path, ref: {
+    "path": path, "content": "print('hi')\n", "sha": "abc", "size": 12}
+
+# 907：组员自己的任务；908：别人的任务
+database.upsert_task(907, "要提交代码的任务", "", "doing", assignee=ME)
+database.upsert_task(908, "别人的任务", "", "doing", assignee=OTHER)
+database.update_task_pr(907, pr_number=None, pr_state="", pr_url="", pr_head="",
+                        pr_allowed=0, pr_allowed_by="")
+
+resp = client.post("/api/tasks/907/code", json={
+    "files": [{"path": "recon/knn.py", "content": "def knn():\n    return 1\n"}],
+    "message": "feat: 实现 KNN",
+})
+check("组员给自己的任务提交代码 → 200", resp.status_code == 200,
+      f"HTTP {resp.status_code} {resp.get_data(as_text=True)[:160]}")
+check("提交调用带了分支与文件",
+      bool(commit_calls) and commit_calls[-1]["branch"] == "task/907"
+      and commit_calls[-1]["files"][0]["path"] == "recon/knn.py",
+      str(commit_calls[-1] if commit_calls else None))
+check("提交信息自动补上了 Issue 编号（否则 Agent 不会审）",
+      commit_calls and "(#907)" in commit_calls[-1]["message"], str(commit_calls[-1]))
+check("分支不存在时从主干创建",
+      commit_calls and commit_calls[-1]["create_from"] == "main", str(commit_calls[-1]))
+check("提交后本地记下了分支", (database.get_task_by_issue(907) or {}).get("branch", "").startswith("task/907"))
+check("提交后自动提了 PR（默认打开）",
+      (database.get_task_by_issue(907) or {}).get("pr_number") == 88,
+      str((database.get_task_by_issue(907) or {}).get("pr_number")))
+
+check("组员给别人的任务提交代码 → 403",
+      client.post("/api/tasks/908/code",
+                  json={"files": [{"path": "a.py", "content": "x"}]}).status_code == 403)
+check("组长可以替别人提交 → 200",
+      lead_client.post("/api/tasks/908/code",
+                       json={"files": [{"path": "a.py", "content": "x"}]}).status_code == 200)
+
+check("路径带 .. → 400",
+      client.post("/api/tasks/907/code",
+                  json={"files": [{"path": "../evil.py", "content": "x"}]}).status_code == 400)
+check("绝对路径 → 400",
+      client.post("/api/tasks/907/code",
+                  json={"files": [{"path": "/etc/passwd", "content": "x"}]}).status_code == 400)
+check("空内容 → 400",
+      client.post("/api/tasks/907/code",
+                  json={"files": [{"path": "a.py", "content": "   "}]}).status_code == 400)
+check("没有文件 → 400", client.post("/api/tasks/907/code", json={"files": []}).status_code == 400)
+check("两个文件同名 → 400",
+      client.post("/api/tasks/907/code", json={"files": [
+          {"path": "a.py", "content": "1"}, {"path": "a.py", "content": "2"}]}).status_code == 400)
+check("多文件一次提交：两个文件都在同一个 commit 里",
+      client.post("/api/tasks/907/code", json={"files": [
+          {"path": "a.py", "content": "1"}, {"path": "recon/b.py", "content": "2"}]}).status_code == 200
+      and len(commit_calls[-1]["files"]) == 2, str(commit_calls[-1]))
+
+# 大小上限（临时把上限调小，验证拦住 + 明确提示）
+original_limit = server.CODE_MAX_FILE_BYTES
+server.CODE_MAX_FILE_BYTES = 10
+try:
+    check("单文件超过上限 → 400",
+          client.post("/api/tasks/907/code", json={
+              "files": [{"path": "big.py", "content": "x" * 50}]}).status_code == 400)
+finally:
+    server.CODE_MAX_FILE_BYTES = original_limit
+
+print()
+print("[16] 把仓库里的文件读进编辑器")
+resp = client.get("/api/tasks/907/file?path=recon/knn.py")
+check("读文件 → 200", resp.status_code == 200, resp.get_data(as_text=True)[:120])
+check("返回了文件内容", resp.get_json().get("content") == "print('hi')\n", str(resp.get_json())[:120])
+check("路径非法 → 400", client.get("/api/tasks/907/file?path=../x").status_code == 400)
+check("未登录不能读文件", server.app.test_client().get(
+    "/api/tasks/907/file?path=a.py").status_code == 401)
+
+print()
 print("=" * 68)
 print("清理测试数据")
 shutil.rmtree(WORKDIR, ignore_errors=True)

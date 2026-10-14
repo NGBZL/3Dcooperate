@@ -1271,6 +1271,189 @@ code {
     border-left-color: hsl(var(--hue, 265) 26% 76%);
 }
 
+/* ============================================================
+   卡片上的纯文本代码编辑器
+   ============================================================ */
+/* 比普通弹窗宽一些：要放下「文件列表 + 编辑区」两栏 */
+.modal-wide .modal-content {
+    max-width: 980px;
+    width: min(96vw, 980px);
+}
+
+.code-layout {
+    display: grid;
+    grid-template-columns: 220px minmax(0, 1fr);
+    gap: 14px;
+    margin-top: 12px;
+    align-items: start;
+}
+
+@media (max-width: 760px) {
+    .code-layout {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.code-side {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    padding: 8px;
+    background: #fafbfb;
+}
+
+.code-side-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-soft);
+    padding: 2px 4px 6px;
+}
+
+.code-file-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 260px;
+    overflow-y: auto;
+}
+
+.code-file-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 6px;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background var(--dur-fast) var(--ease);
+}
+
+.code-file-item:hover {
+    background: #eef1f2;
+}
+
+.code-file-item.active {
+    background: var(--accent-soft);
+    color: var(--accent-deep);
+    font-weight: 600;
+}
+
+.code-file-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: left;
+}
+
+.code-file-size {
+    flex: none;
+    font-size: 11px;
+    color: var(--text-soft);
+    font-weight: 400;
+}
+
+.code-file-del {
+    flex: none;
+    border: 0;
+    background: transparent;
+    color: var(--text-soft);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 2px;
+}
+
+.code-file-del:hover {
+    color: var(--danger-ink);
+}
+
+.code-pick {
+    width: 100%;
+    margin-top: 8px;
+    font-size: 12px;
+}
+
+.code-drop-tip {
+    margin: 6px 2px 0;
+    font-size: 11px;
+    color: var(--text-soft);
+    text-align: center;
+}
+
+.code-main {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.code-path-row {
+    display: flex;
+    gap: 8px;
+}
+
+.code-path-row input {
+    flex: 1;
+    min-width: 0;
+}
+
+.code-content-label {
+    margin-top: 10px;
+}
+
+/* 纯文本编辑区：等宽字体、不折行、没有高亮 —— 就是一块能粘代码的地方 */
+#code-content {
+    width: 100%;
+    min-height: 300px;
+    max-height: 46vh;
+    margin-top: 4px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: #fdfdfd;
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+    white-space: pre;
+    overflow: auto;
+    resize: vertical;
+    tab-size: 4;
+}
+
+#code-content:focus {
+    outline: none;
+    border-color: var(--accent-line);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.code-size-tip {
+    margin: 6px 2px 0;
+    font-size: 11px;
+    color: var(--text-soft);
+}
+
+.code-commit-msg {
+    margin-top: 12px;
+}
+
+.danger-text {
+    color: var(--danger-ink);
+}
+
+/* 「代码」按钮：和 PR 按钮并排，样式保持一致 */
+.icon-btn.code-btn {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .3px;
+    padding: 3px 7px;
+    margin-right: 2px;
+    border: 1px solid var(--line);
+}
+
 /* ---- PR 徽章：卡片上显示 PR 编号与状态 ---- */
 .card-pr {
     margin-top: 8px;

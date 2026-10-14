@@ -201,6 +201,64 @@
     </div>
 </div>
 
+<!-- ===================== 代码编辑器弹窗（纯文本，直接提交到分支） ===================== -->
+<div class="modal modal-wide" id="code-modal" aria-hidden="true">
+    <div class="modal-mask" data-close-code="1"></div>
+    <div class="modal-content" role="dialog" aria-modal="true" aria-labelledby="code-title">
+        <div class="modal-head">
+            <h3 id="code-title">提交代码</h3>
+            <button class="hint hint-start" id="code-help" type="button" aria-label="编辑器说明"
+                    data-hint="纯文本编辑，没有高亮也不会检查语法 —— 把本地 VS Code 里写好的内容整段粘进来就行。可以一次提交多个文件（点「+ 添加文件」，或直接把本地文件拖进这个窗口）。提交会推到一个分支上（默认 task/编号-名字，不存在会自动创建），并自动在提交信息里带上 Issue 编号，这样 Agent 会立刻开始审核。提交后如果没有 PR，会自动帮你提一个。"></button>
+        </div>
+
+        <p class="modal-tip-line" id="code-task-line"></p>
+
+        <div class="code-layout">
+            <div class="code-side">
+                <div class="code-side-head">
+                    <span>文件</span>
+                    <button class="icon-btn" id="btn-code-add" type="button" title="添加一个文件">+</button>
+                </div>
+                <ul class="code-file-list" id="code-file-list"></ul>
+                <button class="btn btn-secondary code-pick" id="btn-code-pick" type="button">选择本地文件…</button>
+                <input type="file" id="code-file-input" multiple hidden>
+                <p class="code-drop-tip">也可以把文件拖进这个窗口</p>
+            </div>
+
+            <div class="code-main">
+                <div class="field">
+                    <label for="code-path">仓库内路径</label>
+                    <div class="code-path-row">
+                        <input type="text" id="code-path" placeholder="recon/knn.py" spellcheck="false">
+                        <button class="btn btn-secondary" id="btn-code-load" type="button"
+                                title="从分支上读这个文件进来改">读入</button>
+                    </div>
+                </div>
+                <label for="code-content" class="code-content-label">文件内容（纯文本）</label>
+                <textarea id="code-content" spellcheck="false" wrap="off"
+                          placeholder="把 VS Code 里写好的代码粘到这里…"></textarea>
+                <p class="code-size-tip" id="code-size-tip"></p>
+            </div>
+        </div>
+
+        <div class="field code-commit-msg">
+            <label for="code-message">提交信息</label>
+            <input type="text" id="code-message" spellcheck="false">
+        </div>
+
+        <label class="checkbox-line">
+            <input type="checkbox" id="code-open-pr" checked>
+            <span>提交后如果没有 PR，就自动提一个（Agent 会立刻开始审核）</span>
+        </label>
+
+        <div class="modal-actions">
+            <button class="btn btn-secondary danger-text" id="btn-code-clear" type="button">清空草稿</button>
+            <button class="btn btn-secondary" id="btn-code-cancel" type="button">取消</button>
+            <button class="btn btn-primary" id="btn-code-submit" type="button">提交到分支</button>
+        </div>
+    </div>
+</div>
+
 <!-- ===================== 模板 ===================== -->
 
 <!-- 看板列模板：状态视图与人员视图共用 -->
@@ -242,6 +300,7 @@
         <div class="card-footer">
             <span class="card-time"></span>
             <div class="card-actions">
+                <button class="icon-btn code-btn" type="button" title="提交代码（纯文本编辑）">代码</button>
                 <button class="icon-btn pr-btn" type="button" title="分支与 PR">PR</button>
                 <button class="icon-btn move-left" type="button" title="移到上一列">←</button>
                 <button class="icon-btn move-right" type="button" title="移到下一列">→</button>

@@ -14,6 +14,7 @@ Token 失效 / 权限不足 / 仓库不存在等情况抛出带中文说明的 G
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 import time
@@ -1035,6 +1036,115 @@ def merge_pull_request(number: int, method: str = "squash") -> dict[str, Any]:
     logger.info("PR #%s 已合并（%s）", number, method)
     return {"merged": bool(data.get("merged")), "message": data.get("message", ""),
             "sha": data.get("sha", "")}
+
+
+def branch_exists(branch: str) -> bool:
+    """
+    分支是否存在。
+
+    :param branch: 分支名
+    :return: True / False（GitHub 的 404 会被 _request 抛成 GitHubError，这里接住）
+    """
+    try:
+        _request("GET", f"/repos/{GITHUB_REPO}/branches/{branch}")
+        return True
+    except GitHubError as exc:
+        if exc.status_code == 404:
+            return False
+        raise
+
+
+def get_file_content(path: str, ref: str) -> Optional[dict[str, Any]]:
+    """
+    读取仓库里某个文件的文本内容（用于「把线上文件读进编辑器」）。
+
+    :param path: 仓库内路径，如 ``recon/knn.py``
+    :param ref: 分支名 / commit SHA
+    :return: {"path", "content", "sha", "size"}；文件不存在时返回 None
+    :raises GitHubError: 路径是目录、文件过大（GitHub 不给内容）等
+    """
+    try:
+        resp = _request("GET", f"/repos/{GITHUB_REPO}/contents/{path}", params={"ref": ref})
+    except GitHubError as exc:
+        if exc.status_code == 404:
+            return None
+        raise
+
+    data = resp.json()
+    if isinstance(data, list):
+        raise GitHubError(f"{path} 是一个目录，不是文件", 400)
+    if (data.get("encoding") or "") == "none" or not data.get("content"):
+        raise GitHubError(
+            f"{path} 太大了（{data.get('size', '?')} 字节），GitHub 不直接返回内容；请在本地打开", 400)
+
+    raw = base64.b64decode(data["content"])
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise GitHubError(f"{path} 不是 UTF-8 文本（可能是二进制文件），看板编辑器只处理纯文本", 400)
+
+    return {"path": data.get("path") or path, "content": text,
+            "sha": data.get("sha"), "size": data.get("size", len(raw))}
+
+
+def commit_files(
+    branch: str,
+    files: list[dict[str, str]],
+    message: str,
+    *,
+    create_from: str = "",
+) -> dict[str, Any]:
+    """
+    把若干文件**一次性**提交到指定分支（一个 commit，不是每个文件一个 commit）。
+
+    走 Git Data API：blob → tree（基于分支当前 tree）→ commit → 更新 ref。
+
+    :param branch: 目标分支
+    :param files: [{"path": 仓库内路径, "content": 文本内容}, ...]
+    :param message: 提交信息（建议带上 Issue 编号，这样 Agent 才会审核）
+    :param create_from: 分支不存在时从哪个分支创建；留空表示不自动创建
+    :return: {"commit", "url", "branch", "files"}
+    :raises GitHubError: 分支不存在、文件列表为空、内容为空等
+    """
+    if not files:
+        raise GitHubError("没有要提交的文件", 400)
+
+    if not branch_exists(branch):
+        if not create_from:
+            raise GitHubError(f"分支 {branch} 不存在", 404)
+        create_branch(branch, create_from)
+
+    head_sha = get_branch_sha(branch)
+    base_tree = _request("GET", f"/repos/{GITHUB_REPO}/git/commits/{head_sha}").json()["tree"]["sha"]
+
+    entries = []
+    for item in files:
+        path = (item.get("path") or "").strip()
+        content = item.get("content")
+        if not path:
+            raise GitHubError("文件路径不能为空", 400)
+        if content is None:
+            raise GitHubError(f"{path} 的内容为空", 400)
+        blob = _request("POST", f"/repos/{GITHUB_REPO}/git/blobs", json_body={
+            "content": base64.b64encode(str(content).encode("utf-8")).decode("ascii"),
+            "encoding": "base64",
+        }).json()
+        entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+
+    tree = _request("POST", f"/repos/{GITHUB_REPO}/git/trees", json_body={
+        "base_tree": base_tree, "tree": entries,
+    }).json()
+    commit = _request("POST", f"/repos/{GITHUB_REPO}/git/commits", json_body={
+        "message": message, "tree": tree["sha"], "parents": [head_sha],
+    }).json()
+    _request("PATCH", f"/repos/{GITHUB_REPO}/git/refs/heads/{branch}",
+             json_body={"sha": commit["sha"], "force": False})
+
+    logger.info("已提交 %d 个文件到 %s（commit %s）",
+                len(entries), branch, commit["sha"][:7])
+    return {"commit": commit["sha"], "url": commit.get("html_url", ""),
+            "branch": branch, "files": [entry["path"] for entry in entries],
+            "message": message}
 
 
 def fetch_branch_commits(branch: str, limit: int = 20) -> list[dict[str, Any]]:

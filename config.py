@@ -221,6 +221,14 @@ PR_SYNC_BUDGET: int = _env_int("PR_SYNC_BUDGET", 25)
 PR_BODY_TEMPLATE: str = _env("PR_BODY_TEMPLATE", "关联任务 #{issue}\n\nCloses #{issue}\n")
 
 # ============================================================
+# 卡片上的纯文本编辑器（直接在网页上提交代码）
+# ============================================================
+# 单个文件 / 单次提交的上限（字节）。纯源码文件远小于这个数，
+# 上限主要是防误贴二进制大文件、也顺手保护 GitHub API 与 Agent 的 diff 预算。
+CODE_MAX_FILE_BYTES: int = _env_int("CODE_MAX_FILE_BYTES", 300_000)
+CODE_MAX_TOTAL_BYTES: int = _env_int("CODE_MAX_TOTAL_BYTES", 1_000_000)
+
+# ============================================================
 # 看板业务配置
 # ============================================================
 # 三个状态（同时也是 GitHub Issue 上的标签名）

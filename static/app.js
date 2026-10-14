@@ -54,6 +54,9 @@ let doneIsFinal = true;                          // 已完成的任务是否不�
 let allowAssignToOthers = false;                  // 是否允许把任务指派给别人（组长恒为 true）
 let isLead = false;                              // 当前登录者是不是组长
 let canMergePr = false;                          // 能否放行 / 合并 PR（组长）
+// 卡片编辑器的上限（与服务端 config 保持一致，超出时前端就拦住）
+const CODE_MAX_FILE_BYTES = 300000;
+const CODE_MAX_TOTAL_BYTES = 1000000;
 
 /* ============================================================
    DOM 引用
@@ -116,6 +119,22 @@ const el = {
     btnPrFinalize: $('btn-pr-finalize'),
     prForce: $('pr-force'),
     prForceLine: $('pr-force-line'),
+    // 代码编辑器
+    codeModal: $('code-modal'),
+    codeTaskLine: $('code-task-line'),
+    codeFileList: $('code-file-list'),
+    codePath: $('code-path'),
+    codeContent: $('code-content'),
+    codeMessage: $('code-message'),
+    codeOpenPr: $('code-open-pr'),
+    codeSizeTip: $('code-size-tip'),
+    codeFileInput: $('code-file-input'),
+    btnCodeAdd: $('btn-code-add'),
+    btnCodePick: $('btn-code-pick'),
+    btnCodeLoad: $('btn-code-load'),
+    btnCodeClear: $('btn-code-clear'),
+    btnCodeCancel: $('btn-code-cancel'),
+    btnCodeSubmit: $('btn-code-submit'),
 };
 
 /* ============================================================
@@ -917,6 +936,15 @@ function buildCard(task) {
     // PR：有 PR 就显示编号与状态（open / draft / 待放行 / 已放行 / merged）
     renderPrChip(node, task);
 
+    // 「代码」按钮：打开纯文本编辑器，直接把代码提交到分支
+    const codeBtn = node.querySelector('.code-btn');
+    if (codeBtn) {
+        codeBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            openCodeEditor(task);
+        });
+    }
+
     // 「PR」按钮：打开分支 / PR 面板（建分支、提 PR、组长放行与合并）
     const prBtn = node.querySelector('.pr-btn');
     if (prBtn) {
@@ -1053,6 +1081,304 @@ function buildCard(task) {
     });
 
     return node;
+}
+
+/* ============================================================
+   卡片上的纯文本编辑器：直接提交代码到分支
+   ============================================================ */
+let codeTask = null;            // 当前正在编辑的任务
+let codeFiles = [];             // [{path, content}]
+let codeIndex = 0;              // 左边列表里选中的第几个文件
+let codeDirty = false;          // 内容有没有未同步到 codeFiles 的改动
+
+/** 草稿在 localStorage 里的键（每个任务一份，刷新不丢）。 */
+function codeDraftKey(issueNumber) {
+    return `kanban.codeDraft.${issueNumber}`;
+}
+
+/** 把当前编辑框里的内容同步回 codeFiles。 */
+function syncCodeEditor() {
+    const item = codeFiles[codeIndex];
+    if (!item || !el.codeContent) return;
+    item.path = el.codePath.value.trim();
+    item.content = el.codeContent.value;
+    codeDirty = false;
+}
+
+/** 存草稿（防止贴了一大段代码刷新就没了）。 */
+function saveCodeDraft() {
+    if (!codeTask) return;
+    syncCodeEditor();
+    try {
+        window.localStorage.setItem(codeDraftKey(codeTask.issue_number), JSON.stringify({
+            files: codeFiles,
+            message: el.codeMessage ? el.codeMessage.value : '',
+            openPr: el.codeOpenPr ? el.codeOpenPr.checked : true,
+            index: codeIndex,
+        }));
+    } catch (error) {
+        // 隐私模式 / 超出配额：存不了就算了，不影响提交
+    }
+}
+
+/** 读草稿；没有草稿时返回 null。 */
+function loadCodeDraft(issueNumber) {
+    try {
+        const raw = window.localStorage.getItem(codeDraftKey(issueNumber));
+        if (!raw) return null;
+        const data = JSON.parse(raw);
+        if (!data || !Array.isArray(data.files) || !data.files.length) return null;
+        return data;
+    } catch (error) {
+        return null;
+    }
+}
+
+/** 清掉草稿。 */
+function clearCodeDraft(issueNumber) {
+    try {
+        window.localStorage.removeItem(codeDraftKey(issueNumber));
+    } catch (error) {
+        // 忽略
+    }
+}
+
+/** 字节数（用 TextEncoder，跟后端算的一致）。 */
+function byteLength(text) {
+    try {
+        return new TextEncoder().encode(text).length;
+    } catch (error) {
+        return String(text).length;
+    }
+}
+
+/** 人类可读的大小。 */
+function humanSize(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+}
+
+/** 重新渲染左边的文件列表。 */
+function renderCodeFileList() {
+    if (!el.codeFileList) return;
+    el.codeFileList.textContent = '';
+    codeFiles.forEach((item, index) => {
+        const li = document.createElement('li');
+        li.className = 'code-file-item' + (index === codeIndex ? ' active' : '');
+        li.title = item.path || '（还没填路径）';
+
+        const name = document.createElement('span');
+        name.className = 'code-file-name';
+        setText(name, item.path || '（还没填路径）');
+        li.appendChild(name);
+
+        const size = document.createElement('span');
+        size.className = 'code-file-size';
+        setText(size, humanSize(byteLength(item.content || '')));
+        li.appendChild(size);
+
+        const remove = document.createElement('button');
+        remove.className = 'code-file-del';
+        remove.type = 'button';
+        remove.title = '从这次提交里去掉';
+        setText(remove, '×');
+        remove.addEventListener('click', (event) => {
+            event.stopPropagation();
+            codeFiles.splice(index, 1);
+            if (!codeFiles.length) codeFiles.push({ path: '', content: '' });
+            codeIndex = Math.min(codeIndex, codeFiles.length - 1);
+            showCodeFile(codeIndex);
+            saveCodeDraft();
+        });
+        li.appendChild(remove);
+
+        li.addEventListener('click', () => {
+            syncCodeEditor();
+            codeIndex = index;
+            showCodeFile(index);
+            saveCodeDraft();
+        });
+
+        el.codeFileList.appendChild(li);
+    });
+}
+
+/** 把第 index 个文件显示到右边编辑区。 */
+function showCodeFile(index) {
+    const item = codeFiles[index] || { path: '', content: '' };
+    if (el.codePath) el.codePath.value = item.path || '';
+    if (el.codeContent) el.codeContent.value = item.content || '';
+    codeDirty = false;
+    renderCodeFileList();
+    updateCodeSizeTip();
+}
+
+/** 更新右下角的大小提示 + 提交按钮可用性。 */
+function updateCodeSizeTip() {
+    if (!el.codeSizeTip) return;
+    const current = codeFiles[codeIndex] || { content: '' };
+    const size = byteLength(el.codeContent ? el.codeContent.value : current.content || '');
+    const total = codeFiles.reduce((sum, item) => sum + byteLength(item.content || ''), 0);
+    setText(el.codeSizeTip, `当前文件 ${humanSize(size)} · 本次提交共 ${codeFiles.length} 个文件 ${humanSize(total)}`);
+
+    const tooBig = size > CODE_MAX_FILE_BYTES || total > CODE_MAX_TOTAL_BYTES;
+    if (el.btnCodeSubmit) el.btnCodeSubmit.disabled = tooBig;
+    if (tooBig) {
+        showStatus(`文件太大：单个文件上限 ${humanSize(CODE_MAX_FILE_BYTES)}，`
+            + `单次提交上限 ${humanSize(CODE_MAX_TOTAL_BYTES)}`, 'error');
+    }
+}
+
+/** 打开代码编辑器。 */
+function openCodeEditor(task) {
+    codeTask = task;
+    if (!el.codeModal) return;
+
+    setText(el.codeTaskLine, `#${task.issue_number} ${task.title || ''}`.trim()
+        + (task.branch ? ` · 分支 ${task.branch}` : ''));
+
+    const draft = loadCodeDraft(task.issue_number);
+    if (draft) {
+        codeFiles = draft.files.map((item) => ({
+            path: item.path || '', content: item.content || '',
+        }));
+        codeIndex = Math.min(draft.index || 0, codeFiles.length - 1);
+        if (el.codeMessage) el.codeMessage.value = draft.message || '';
+        if (el.codeOpenPr) el.codeOpenPr.checked = draft.openPr !== false;
+    } else {
+        codeFiles = [{ path: '', content: '' }];
+        codeIndex = 0;
+        if (el.codeMessage) el.codeMessage.value = defaultCommitMessage(task);
+        if (el.codeOpenPr) el.codeOpenPr.checked = true;
+    }
+    if (codeIndex < 0) codeIndex = 0;
+    showCodeFile(codeIndex);
+    showModal(el.codeModal);
+}
+
+/** 默认提交信息：带上 Issue 编号，Agent 才会审核。 */
+function defaultCommitMessage(task) {
+    const title = String(task.title || '').trim() || `任务 ${task.issue_number}`;
+    return `feat: ${title} (#${task.issue_number})`;
+}
+
+/** 添加一个空文件。 */
+function addCodeFile(path = '', content = '') {
+    syncCodeEditor();
+    codeFiles.push({ path, content });
+    codeIndex = codeFiles.length - 1;
+    showCodeFile(codeIndex);
+    saveCodeDraft();
+    if (el.codePath) el.codePath.focus();
+}
+
+/** 从本地选择 / 拖进来的文件读成文本。 */
+async function addLocalFiles(fileList) {
+    const items = Array.from(fileList || []);
+    if (!items.length) return;
+    syncCodeEditor();
+    if (codeFiles.length === 1 && !codeFiles[0].path && !codeFiles[0].content) codeFiles = [];
+
+    for (const file of items) {
+        try {
+            const text = await file.text();
+            // 已知的不对劲内容给个提示（二进制文件读出来会是乱码）
+            if (text.includes('\u0000')) {
+                showStatus(`${file.name} 看起来是二进制文件，纯文本编辑器处理不了`, 'error');
+                continue;
+            }
+            codeFiles.push({ path: file.name, content: text });
+        } catch (error) {
+            showStatus(`读取 ${file.name} 失败：${error.message}`, 'error');
+        }
+    }
+    codeIndex = Math.max(0, codeFiles.length - 1);
+    if (!codeFiles.length) codeFiles = [{ path: '', content: '' }];
+    showCodeFile(codeIndex);
+    saveCodeDraft();
+}
+
+/** 从仓库读一个文件进编辑器（改已有文件时用）。 */
+async function loadCodeFileFromRepo() {
+    if (!codeTask) return;
+    const path = (el.codePath.value || '').trim();
+    if (!path) {
+        showStatus('先填仓库内路径，再点「读入」', 'error');
+        return;
+    }
+    if (el.btnCodeLoad) el.btnCodeLoad.disabled = true;
+    try {
+        const data = await api(`/api/tasks/${codeTask.issue_number}/file?path=${encodeURIComponent(path)}`);
+        syncCodeEditor();
+        const item = codeFiles[codeIndex] || { path, content: '' };
+        item.path = data.path || path;
+        item.content = data.content || '';
+        codeFiles[codeIndex] = item;
+        showCodeFile(codeIndex);
+        saveCodeDraft();
+        showStatus(data.message || '已读入', data.exists === false ? 'info' : 'success');
+    } catch (error) {
+        // api() 已经提示过
+    } finally {
+        if (el.btnCodeLoad) el.btnCodeLoad.disabled = false;
+    }
+}
+
+/** 提交代码。 */
+async function submitCode() {
+    if (!codeTask) return;
+    syncCodeEditor();
+
+    const files = codeFiles
+        .map((item) => ({ path: (item.path || '').trim(), content: item.content || '' }))
+        .filter((item) => item.path || item.content.trim());
+    if (!files.length) {
+        showStatus('还没有内容可以提交：粘贴代码或选择本地文件', 'error');
+        return;
+    }
+    const missing = files.find((item) => !item.path);
+    if (missing) {
+        showStatus('有文件还没填仓库内路径（例如 recon/knn.py）', 'error');
+        return;
+    }
+
+    if (el.btnCodeSubmit) {
+        el.btnCodeSubmit.disabled = true;
+        el.btnCodeSubmit.textContent = '提交中…';
+    }
+    try {
+        const data = await api(`/api/tasks/${codeTask.issue_number}/code`, {
+            method: 'POST',
+            body: JSON.stringify({
+                files,
+                message: (el.codeMessage.value || '').trim(),
+                open_pr: el.codeOpenPr ? el.codeOpenPr.checked : true,
+            }),
+        });
+        clearCodeDraft(codeTask.issue_number);
+        codeFiles = [{ path: '', content: '' }];
+        codeIndex = 0;
+        dismissModal(el.codeModal);
+        showStatus(data.message || '提交成功', 'success');
+        await loadTasks(true);
+        // 提交会顺手提 PR，把卡片上的 PR 徽章刷新出来
+        if (data.pr_number) {
+            const fresh = tasks.find((item) => item.issue_number === codeTask.issue_number);
+            if (fresh) Object.assign(fresh, {
+                pr_number: data.pr_number, pr_state: data.pr_state || 'open',
+                pr_url: data.pr_url || '', branch: data.branch,
+            });
+            render();
+        }
+    } catch (error) {
+        // api() 已经提示过；草稿留着，内容不丢
+    } finally {
+        if (el.btnCodeSubmit) {
+            el.btnCodeSubmit.disabled = false;
+            el.btnCodeSubmit.textContent = '提交到分支';
+        }
+    }
 }
 
 /* ============================================================
@@ -1850,12 +2176,107 @@ el.prModal.addEventListener('click', (event) => {
     if (event.target.dataset.closePr) dismissModal(el.prModal);
 });
 
+// 代码编辑器
+el.codeModal.addEventListener('click', (event) => {
+    if (event.target.dataset.closeCode) {
+        syncCodeEditor();
+        saveCodeDraft();
+        dismissModal(el.codeModal);
+    }
+});
+el.btnCodeAdd.addEventListener('click', () => addCodeFile());
+el.btnCodePick.addEventListener('click', () => el.codeFileInput.click());
+el.codeFileInput.addEventListener('change', async () => {
+    await addLocalFiles(el.codeFileInput.files);
+    el.codeFileInput.value = '';           // 允许再选同一个文件
+});
+el.btnCodeLoad.addEventListener('click', loadCodeFileFromRepo);
+el.btnCodeCancel.addEventListener('click', () => {
+    syncCodeEditor();
+    saveCodeDraft();
+    dismissModal(el.codeModal);
+});
+el.btnCodeSubmit.addEventListener('click', submitCode);
+el.btnCodeClear.addEventListener('click', () => {
+    if (!codeTask) return;
+    clearCodeDraft(codeTask.issue_number);
+    codeFiles = [{ path: '', content: '' }];
+    codeIndex = 0;
+    el.codeMessage.value = defaultCommitMessage(codeTask);
+    showCodeFile(0);
+    showStatus('草稿已清空', 'info');
+});
+
+// 编辑区：路径换行 / 内容变化时同步回内存并存草稿（防刷新丢内容）
+el.codePath.addEventListener('input', () => {
+    const item = codeFiles[codeIndex];
+    if (item) item.path = el.codePath.value.trim();
+    renderCodeFileList();
+    scheduleCodeDraftSave();
+});
+el.codeContent.addEventListener('input', () => {
+    const item = codeFiles[codeIndex];
+    if (item) item.content = el.codeContent.value;
+    codeDirty = true;
+    updateCodeSizeTip();
+    scheduleCodeDraftSave();
+});
+el.codeMessage.addEventListener('input', scheduleCodeDraftSave);
+if (el.codeOpenPr) el.codeOpenPr.addEventListener('change', scheduleCodeDraftSave);
+
+// Tab 键在编辑区里插入四个空格（纯文本编辑器，不抢焦点）
+el.codeContent.addEventListener('keydown', (event) => {
+    if (event.key === 'Tab') {
+        event.preventDefault();
+        const area = el.codeContent;
+        const start = area.selectionStart;
+        const end = area.selectionEnd;
+        area.value = area.value.slice(0, start) + '    ' + area.value.slice(end);
+        area.selectionStart = area.selectionEnd = start + 4;
+        const item = codeFiles[codeIndex];
+        if (item) item.content = area.value;
+        updateCodeSizeTip();
+        scheduleCodeDraftSave();
+    }
+    // Ctrl/Cmd + Enter 直接提交
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+        event.preventDefault();
+        submitCode();
+    }
+});
+
+// 把本地文件拖进编辑器窗口（VS Code 里导出、或直接拖文件）
+['dragover', 'drop'].forEach((type) => {
+    el.codeModal.addEventListener(type, async (event) => {
+        if (!el.codeModal.classList.contains('active')) return;
+        event.preventDefault();
+        if (type === 'drop' && event.dataTransfer && event.dataTransfer.files) {
+            await addLocalFiles(event.dataTransfer.files);
+        }
+    });
+});
+
+let codeDraftTimer = null;
+/** 拖一下再存草稿，避免每敲一个字都写 localStorage。 */
+function scheduleCodeDraftSave() {
+    if (codeDraftTimer) clearTimeout(codeDraftTimer);
+    codeDraftTimer = setTimeout(() => {
+        codeDraftTimer = null;
+        saveCodeDraft();
+    }, 400);
+}
+
 // 键盘：Esc 关闭弹窗，弹窗内 Ctrl/Cmd + Enter 提交
 document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
         if (el.modal.classList.contains('active')) closeModal();
         if (el.pwdModal.classList.contains('active')) closePwdModal();
         if (el.prModal.classList.contains('active')) dismissModal(el.prModal);
+        if (el.codeModal.classList.contains('active')) {
+            syncCodeEditor();
+            saveCodeDraft();
+            dismissModal(el.codeModal);
+        }
     }
     if ((event.ctrlKey || event.metaKey) && event.key === 'Enter' && el.modal.classList.contains('active')) {
         createTask();
