@@ -482,18 +482,23 @@ def set_issue_status(issue_number: int, status: str) -> dict[str, Any]:
 
 def status_from_labels(issue: dict[str, Any]) -> str:
     """
-    从 Issue 的标签推断看板状态；没有状态标签时，关闭的 Issue 视为 done。
+    从 Issue 的标签推断看板状态。
+
+    **Issue 已关闭 = done，优先级高于标签**：Issue 被关闭只有两种来路 ——
+    Agent 审核通过后关闭，或者 PR 合并时 ``Closes #N`` 自动关闭。
+    这两种都意味着「活干完了」，所以哪怕它还挂着 `doing` / `todo` 标签，
+    看板也应该显示在 Done 列（否则会出现「PR 都合并了、卡片还赖在 Doing」）。
 
     :param issue: GitHub Issue 字典
     :return: todo / doing / done
     """
+    if issue.get("state") == "closed":
+        return "done"
+
     labels = [item["name"] for item in issue.get("labels", [])]
     for name in labels:
         if name in LABEL_TO_STATUS:
             return LABEL_TO_STATUS[name]
-
-    if issue.get("state") == "closed":
-        return "done"
     return "todo"
 
 

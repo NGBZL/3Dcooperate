@@ -544,6 +544,29 @@ const press = (key) => input.dispatchEvent(new window.KeyboardEvent('keydown', {
     check('点「允许合并」会调用 /pr/allow',
         state.writes.slice(writesBefore6).some((w) => /\/api\/tasks\/11\/pr\/allow$/.test(w.url)),
         JSON.stringify(state.writes.slice(writesBefore6)));
+    check('组长能看到「强制合并」勾选项',
+        document.getElementById('pr-force-line').hidden === false);
+
+    // —— 已合并但没收尾：组长能看到「标记完成并关闭 Issue」 ——
+    const stubTask11 = state.tasks.find((t) => t.issue_number === 11);
+    stubTask11.pr_state = 'merged';
+    await window.loadTasks(true);
+    window.render();
+    await wait(60);
+    document.querySelector('.card[data-issue="11"] .pr-btn').click();
+    await wait(40);
+    check('已合并但没进 Done：出现「标记完成并关闭 Issue」',
+        document.getElementById('btn-pr-finalize').hidden === false);
+    check('面板里提示要补一次收尾',
+        /补一次收尾/.test(document.getElementById('pr-status').textContent),
+        document.getElementById('pr-status').textContent);
+    const writesBefore7 = state.writes.length;
+    document.getElementById('btn-pr-finalize').click();
+    await wait(150);
+    check('点它会调用 /pr/finalize',
+        state.writes.slice(writesBefore7).some((w) => /\/api\/tasks\/11\/pr\/finalize$/.test(w.url)),
+        JSON.stringify(state.writes.slice(writesBefore7)));
+    stubTask11.pr_state = 'open';           // 还原，后面还有别的小节要看卡片
 
     document.getElementById('btn-pr-close').click();
     await wait(260);
@@ -558,6 +581,10 @@ const press = (key) => input.dispatchEvent(new window.KeyboardEvent('keydown', {
     await wait(40);
     check('组员看不到「允许合并」', document.getElementById('btn-pr-allow').hidden === true);
     check('组员看不到「合并」', document.getElementById('btn-pr-merge').hidden === true);
+    check('组员也看不到「标记完成并关闭 Issue」',
+        document.getElementById('btn-pr-finalize').hidden === true);
+    check('组员也看不到「强制合并」勾选项',
+        document.getElementById('pr-force-line').hidden === true);
     check('组员面板里提示只有组长能做', /只有组长/.test(document.getElementById('pr-status').textContent));
     document.getElementById('btn-pr-close').click();
     await wait(260);

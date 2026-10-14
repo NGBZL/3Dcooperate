@@ -393,6 +393,13 @@ github_client.create_pull_request = lambda head, base="main", title="", body="",
 github_client.post_issue_comment = lambda number, body: {"id": 1}
 github_client.merge_pull_request = lambda number, method="squash": {
     "merged": True, "message": "Pull Request successfully merged", "sha": "abc"}
+# 合并前会现读一次 Issue 评论里的最新审核结论；这里给一个「已过审」的桩
+github_client.get_issue_comments = lambda number: [{"body": "占位", "id": 1}]
+github_client.parse_review_from_comments = lambda comments: {
+    "passed": True, "score": 90, "comment": "实现没问题", "text": "报告"}
+# 合并后的收尾（标 done + 关 Issue）也是看板写的，同样打桩
+github_client.set_issue_status = lambda number, status: {"number": number}
+github_client.update_issue = lambda number, **kwargs: {"number": number}
 
 database.upsert_task(903, "带 PR 的任务", "", "doing", assignee=ME)
 database.upsert_task(904, "别人的 PR 任务", "", "doing", assignee=OTHER)
@@ -425,6 +432,86 @@ check("放行后组长合并 → 200",
       lead_client.post("/api/tasks/903/pr/merge", json={}).status_code == 200)
 check("合并后 PR 状态是 merged",
       database.get_task_by_issue(903)["pr_state"] == "merged")
+
+print()
+print("[12] 合并闸门：Agent 过审 + 组长放行，两条都满足才合并；合并后自动进 Done")
+print("=" * 68)
+github_client.create_branch = lambda branch, from_branch="main": {
+    "name": branch, "created": True, "sha": "0" * 40}
+github_client.create_pull_request = lambda head, base="main", title="", body="", draft=False: {
+    "number": 88, "state": "open", "title": title, "url": "https://example/pr/88",
+    "head": head, "base": base, "merged": False, "draft": False, "created": True}
+github_client.post_issue_comment = lambda number, body: {"id": 1}
+github_client.merge_pull_request = lambda number, method="squash": {
+    "merged": True, "message": "ok", "sha": "abc"}
+
+# 这两步是「合并后收尾」：看板自己把 Issue 标 done 并关闭
+finalize_calls: list[tuple] = []
+github_client.set_issue_status = lambda number, status: (
+    finalize_calls.append(("label", number, status)) or {"number": number})
+github_client.update_issue = lambda number, **kw: (
+    finalize_calls.append(("state", number, kw.get("state"))) or {"number": number})
+
+# 审核报告的解析结果由这个桩控制（模拟 Issue 评论里最新的 Agent 报告）
+verdict = {"value": None}
+github_client.get_issue_comments = lambda number: [{"body": "占位", "id": 1}]
+github_client.parse_review_from_comments = lambda comments: verdict["value"]
+
+database.upsert_task(905, "待合并的任务", "", "doing", assignee=ME)
+lead_client.post("/api/tasks/905/branch", json={"name": "task/905-fix"})
+client.post("/api/tasks/905/pr", json={"head": "task/905-fix"})
+
+verdict["value"] = None
+check("还没有 Agent 报告时：组长合并 → 403",
+      lead_client.post("/api/tasks/905/pr/merge", json={}).status_code == 403)
+check("先放行", lead_client.post("/api/tasks/905/pr/allow", json={}).status_code == 200)
+check("放行了但还没有 Agent 报告：合并仍然 → 403",
+      lead_client.post("/api/tasks/905/pr/merge", json={}).status_code == 403)
+
+verdict["value"] = {"passed": False, "score": 40, "comment": "有内存泄漏", "text": "报告"}
+check("Agent 没过审：合并不了 → 403",
+      lead_client.post("/api/tasks/905/pr/merge", json={}).status_code == 403)
+check("提示里说清了是审核没过",
+      "审核" in (lead_client.post("/api/tasks/905/pr/merge", json={}).get_json() or {}).get("error", ""))
+check("组员依然不能合并 → 403",
+      client.post("/api/tasks/905/pr/merge", json={}).status_code == 403)
+
+verdict["value"] = {"passed": True, "score": 92, "comment": "没问题", "text": "报告"}
+check("Agent 过审 + 已放行：合并 → 200",
+      lead_client.post("/api/tasks/905/pr/merge", json={}).status_code == 200)
+check("合并后 PR 状态是 merged",
+      database.get_task_by_issue(905)["pr_state"] == "merged")
+check("合并后看板自己把 Issue 标成 done 标签",
+      ("label", 905, "done") in finalize_calls, finalize_calls)
+check("合并后看板自己关闭了 Issue",
+      ("state", 905, "closed") in finalize_calls, finalize_calls)
+check("合并后本地卡片状态就是 done（不用等下次同步）",
+      database.get_task_by_issue(905)["status"] == "done", database.get_task_by_issue(905)["status"])
+
+print()
+print("[13] 补收尾接口（已经合过、但还赖在 Doing 的卡片）")
+database.upsert_task(906, "早就合过但没收尾", "", "doing", assignee=ME)
+database.update_task_pr(906, pr_number=99, pr_state="merged", pr_head="task/906")
+finalize_calls.clear()
+check("组员不能补收尾 → 403",
+      client.post("/api/tasks/906/pr/finalize", json={}).status_code == 403)
+check("组长补收尾 → 200",
+      lead_client.post("/api/tasks/906/pr/finalize", json={}).status_code == 200)
+check("补收尾确实写了 done 标签与 closed",
+      ("label", 906, "done") in finalize_calls and ("state", 906, "closed") in finalize_calls,
+      finalize_calls)
+check("补收尾后本地状态是 done", database.get_task_by_issue(906)["status"] == "done")
+
+print()
+print("[14] Issue 关闭即 Done（标签说什么都不重要）")
+check("已关闭 + 还挂着 doing 标签 → done",
+      github_client.status_from_labels({"state": "closed", "labels": [{"name": "doing"}]}) == "done")
+check("已关闭 + 还挂着 todo 标签 → done",
+      github_client.status_from_labels({"state": "closed", "labels": [{"name": "todo"}]}) == "done")
+check("开着 + doing 标签 → doing",
+      github_client.status_from_labels({"state": "open", "labels": [{"name": "doing"}]}) == "doing")
+check("开着 + 没标签 → todo",
+      github_client.status_from_labels({"state": "open", "labels": []}) == "todo")
 
 print()
 print("=" * 68)

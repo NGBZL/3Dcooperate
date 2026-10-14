@@ -113,6 +113,9 @@ const el = {
     btnPrOpen: $('btn-pr-open'),
     btnPrAllow: $('btn-pr-allow'),
     btnPrMerge: $('btn-pr-merge'),
+    btnPrFinalize: $('btn-pr-finalize'),
+    prForce: $('pr-force'),
+    prForceLine: $('pr-force-line'),
 };
 
 /* ============================================================
@@ -1138,19 +1141,31 @@ function renderPrPanelState(task) {
         lines.push('还没有分支：点「建分支」会基于目标分支创建。');
     }
 
+    const mergedNotDone = task.pr_number && task.pr_state === 'merged' && task.status !== 'done';
+
     if (task.pr_number) {
         const state = PR_STATE_TEXT[task.pr_state] || task.pr_state || '未知';
         lines.push(`PR：<a href="${task.pr_url || '#'}" target="_blank" rel="noopener noreferrer">`
             + `#${task.pr_number}</a>（${state}${task.pr_allowed ? ' · 已放行' : ' · 待组长放行'}）`);
-        if (task.pr_state === 'merged') {
-            lines.push('已合并：等下一次同步，GitHub 关闭 Issue 后卡片会自动进 Done。');
+        if (task.pr_state === 'merged' && task.status === 'done') {
+            lines.push('已合并：Issue 已关闭，卡片在 Done 列。');
         }
     } else {
         lines.push('还没有 PR：把代码推到分支后点「提 PR」。');
     }
+
+    // 合并前的闸门：组长放行 + Agent 过审，两条都满足才能合
+    if (task.pr_number && task.pr_state !== 'merged') {
+        lines.push('合并需要两个条件都满足：<b>组长放行</b> + <b>Agent 审核通过</b>；'
+            + '合并后看板会自动把 Issue 标成 done 并关闭，卡片进 Done。');
+    }
+    if (mergedNotDone) {
+        lines.push('这个 PR 已经合并，但 Issue 还没标成 done（卡片还赖在 Doing）：'
+            + '点「标记完成并关闭 Issue」补一次收尾。');
+    }
     lines.push(canMergePr
-        ? '你是组长：可以放行并合并。'
-        : '放行与合并只有组长能做；提 PR 后等组长处理。');
+        ? '你是组长：可以放行、合并、补收尾。'
+        : '放行、合并、补收尾只有组长能做；提 PR 后等组长处理。');
 
     if (el.prStatus) {
         el.prStatus.innerHTML = lines.join('<br>');   // 内容全部来自后端字段/常量，已转义
@@ -1164,6 +1179,9 @@ function renderPrPanelState(task) {
     if (el.btnPrMerge) {
         el.btnPrMerge.disabled = !task.pr_number || task.pr_state === 'merged' || !task.pr_allowed;
     }
+    // 「标记完成并关闭 Issue」只在「已合并但还没进 Done」且是组长时出现
+    if (el.btnPrFinalize) el.btnPrFinalize.hidden = !(canMergePr && mergedNotDone);
+    if (el.prForceLine) el.prForceLine.hidden = !canMergePr || !task.pr_number;
 }
 
 /** 极简 HTML 转义（面板里用 innerHTML 拼小段说明时用）。 */
@@ -1241,15 +1259,32 @@ async function allowPrForTask() {
     }
 }
 
-/** 组长：合并 PR。 */
+/** 组长：合并 PR（必须先放行；Agent 过审是另一道闸门，可在面板上强制越过）。 */
 async function mergePrForTask() {
     if (!prTask) return;
-    if (!confirm(`确定合并 PR #${prTask.pr_number} 吗？\n（合并后 GitHub 会关闭 Issue，卡片会在下次同步进 Done）`)) {
+    const force = Boolean(el.prForce && el.prForce.checked);
+    const note = force ? '\n\n已勾选「强制合并」：会忽略 Agent 的结论。' : '';
+    if (!confirm(`确定合并 PR #${prTask.pr_number} 吗？\n`
+        + '（合并后看板会把 Issue 标成 done 并关闭，卡片进 Done）' + note)) {
         return;
     }
     try {
-        const data = await api(`/api/tasks/${prTask.issue_number}/pr/merge`, { method: 'POST' });
+        const data = await api(`/api/tasks/${prTask.issue_number}/pr/merge`, {
+            method: 'POST',
+            body: JSON.stringify({ force }),
+        });
         await refreshAfterPrAction(data.message || '已合并');
+    } catch (error) {
+        // api() 已经提示过
+    }
+}
+
+/** 组长：给「已合并但还没进 Done」的卡片补一次收尾。 */
+async function finalizePrForTask() {
+    if (!prTask) return;
+    try {
+        const data = await api(`/api/tasks/${prTask.issue_number}/pr/finalize`, { method: 'POST' });
+        await refreshAfterPrAction(data.message || '已标记完成');
     } catch (error) {
         // api() 已经提示过
     }
@@ -1810,6 +1845,7 @@ el.btnBranch.addEventListener('click', createBranchForTask);
 el.btnPrOpen.addEventListener('click', openPrForTask);
 el.btnPrAllow.addEventListener('click', allowPrForTask);
 el.btnPrMerge.addEventListener('click', mergePrForTask);
+el.btnPrFinalize.addEventListener('click', finalizePrForTask);
 el.prModal.addEventListener('click', (event) => {
     if (event.target.dataset.closePr) dismissModal(el.prModal);
 });

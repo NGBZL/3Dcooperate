@@ -1358,6 +1358,27 @@ code {
     border: 1px solid var(--line);
 }
 
+/* 分支 / PR 面板里的勾选项（强制合并之类） */
+.checkbox-line {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 10px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-soft);
+    cursor: pointer;
+}
+
+.checkbox-line[hidden] {
+    display: none;
+}
+
+.checkbox-line input {
+    margin-top: 2px;
+    flex: none;
+}
+
 /* 分支 / PR 面板里的状态说明 */
 .pr-status {
     margin-top: 12px;

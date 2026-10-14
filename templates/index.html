@@ -185,8 +185,14 @@
 
         <div class="pr-status" id="pr-status"></div>
 
+        <label class="checkbox-line lead-only" id="pr-force-line" hidden>
+            <input type="checkbox" id="pr-force">
+            <span>强制合并（忽略 Agent 结论 / 还没审核就合，风险自负）</span>
+        </label>
+
         <div class="modal-actions pr-actions">
             <button class="btn btn-secondary" id="btn-pr-close" type="button">关闭</button>
+            <button class="btn btn-secondary" id="btn-pr-finalize" type="button" hidden>标记完成并关闭 Issue</button>
             <button class="btn btn-secondary" id="btn-branch" type="button">建分支</button>
             <button class="btn btn-primary" id="btn-pr-open" type="button">提 PR</button>
             <button class="btn btn-secondary lead-only" id="btn-pr-allow" type="button" hidden>允许合并</button>

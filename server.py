@@ -1120,14 +1120,76 @@ def allow_task_pr(issue_number: int):
               message=f"已放行 PR #{pr_number}，现在可以合并了。（{note}）")
 
 
+def _latest_agent_verdict(issue_number: int) -> Optional[dict[str, Any]]:
+    """
+    现读一次 Issue 评论里最新的 Agent 审核报告。
+
+    合并前的闸门要用**最新**结论，不能依赖本地缓存（可能还没同步过）。
+
+    :param issue_number: Issue 编号
+    :return: 审核结果字典；没有报告时返回 None
+    """
+    try:
+        comments = github_client.get_issue_comments(issue_number)
+    except GitHubError as exc:
+        logger.warning("读取 Issue #%s 的审核评论失败：%s", issue_number, exc.message)
+        return None
+    return github_client.parse_review_from_comments(comments)
+
+
+def _finalize_merged_issue(issue_number: int, pr_number: Any, *, why: str) -> bool:
+    """
+    合并完成后的收尾：把 Issue 标成 done 并关闭。
+
+    为什么要看板亲自做这件事：
+
+    * PR 正文里的 ``Closes #编号`` 只在「PR 是看板建的」时才存在，
+      组员直接在 GitHub 上提的 PR 合并后 Issue 还开着；
+    * Agent 在 PR 事件里是**只审核不定案**的，也不会去打 done 标签；
+    * 合并到主干后那次 push 事件里，提交信息往往是 ``标题 (#PR编号)``，
+      没有 Issue 编号，Agent 同样不会定案。
+
+    所以「合并」这个动作本身就由看板补齐最后一步：标签 done + 关闭 Issue。
+    写失败不影响合并结果（PR 已经合了），只记日志、下一轮同步/再点一次即可。
+
+    :param issue_number: Issue 编号
+    :param pr_number: PR 编号（只用于日志）
+    :param why: 触发原因（写进日志与操作日志）
+    :return: 是否成功把 Issue 标成 done
+    """
+    try:
+        # 先换标签（保留 bug 之类的业务标签，只替换 todo/doing/done）
+        github_client.set_issue_status(issue_number, "done")
+        github_client.update_issue(issue_number, state="closed")
+    except GitHubError as exc:
+        logger.error("PR #%s 已合并，但把 Issue #%s 标成 done 失败：%s",
+                     pr_number, issue_number, exc.message)
+        database.log_operation(_me(), "finalize_pr", issue_number=issue_number,
+                               result="error", detail=f"{why}；{exc.message}")
+        return False
+
+    database.update_task_status(issue_number, "done")
+    database.log_operation(_me(), "finalize_pr", issue_number=issue_number,
+                           old_value="doing", new_value="done", detail=why)
+    logger.info("Issue #%s 已标成 done 并关闭（%s）", issue_number, why)
+    return True
+
+
 @app.route("/api/tasks/<int:issue_number>/pr/merge", methods=["POST"])
 @auth.api_login_required
 def merge_task_pr(issue_number: int):
     """
     **组长合并 PR**（默认 squash）。
 
-    只有组长能调用；而且必须先「放行」。合并后 GitHub 会因为 PR 正文里的
-    ``Closes #编号`` 自动关闭 Issue，看板下次同步就把卡片放进 Done。
+    合并前的闸门（缺一不可，``force=1`` 可以让组长强行越过 Agent 这一条）：
+
+    1. 你是组长；
+    2. 这个 PR 已经「放行」（组长点过允许）；
+    3. Agent 已经审核通过（现读 Issue 评论里最新的报告，不依赖本地缓存）。
+
+    合并后看板会立刻替你把 Issue 标成 ``done`` 并关闭 —— 因为组员自己在 GitHub 上提的 PR
+    未必带 ``Closes #编号``，而 Agent 在 PR 模式下是只审核不定案的。
+    这样「Agent 过审 + 组长同意合并」两个条件都满足时，卡片就会进 Done。
     """
     message = auth.check_lead(_me())
     if message:
@@ -1139,11 +1201,34 @@ def merge_task_pr(issue_number: int):
     pr_number = task.get("pr_number")
     if not pr_number:
         return fail(f"#{issue_number} 还没有 PR", 400)
-    if not task.get("pr_allowed"):
-        return _deny("这个 PR 还没放行：请先点「允许」再合并", "merge_pr", issue_number)
 
     data = _parse_json_body()
     method = str(data.get("method") or PR_MERGE_METHOD).lower()
+    force = bool(data.get("force"))
+
+    if not task.get("pr_allowed"):
+        return _deny("这个 PR 还没放行：请先点「允许」再合并", "merge_pr", issue_number)
+
+    # ---- 闸门 3：Agent 必须过审（现读最新报告）----
+    review = _latest_agent_verdict(issue_number)
+    if review is None:
+        if not force:
+            return _deny(
+                "这个任务的 Issue 下还没有 Agent 审核报告：等 Agent 审完（提交信息里带上 Issue 编号，"
+                "例如 `#%d`）再合并；确实要先合就勾上「强制合并」" % issue_number,
+                "merge_pr", issue_number)
+        logger.warning("组长强制合并 PR #%s：Issue #%s 还没有 Agent 审核报告",
+                       pr_number, issue_number)
+    elif not review.get("passed") and not force:
+        score = review.get("score")
+        comment = (review.get("comment") or "见 Issue 评论").strip().replace("\n", " ")
+        if len(comment) > 90:
+            comment = comment[:90] + "…"
+        return _deny(
+            f"Agent 审核没有通过（{('评分 %s，' % score) if score is not None else ''}"
+            f"最新评语：{comment}）：先按建议改代码再合并；"
+            f"确实要合就勾上「强制合并」",
+            "merge_pr", issue_number)
 
     try:
         result = github_client.merge_pull_request(int(pr_number), method)
@@ -1154,13 +1239,61 @@ def merge_task_pr(issue_number: int):
         return fail(exc.message, exc.status_code or 502)
 
     database.update_task_pr(issue_number, pr_state="merged")
+
+    # ---- 收尾：标 done + 关闭 Issue（失败也不影响「已合并」这个事实）----
+    finalized = _finalize_merged_issue(issue_number, pr_number, why=f"PR #{pr_number} 已合并（{method}）")
+
     database.log_operation(_me(), "merge_pr", issue_number=issue_number,
                            new_value=f"PR #{pr_number}（{method}）")
     realtime.notify_tasks_changed("merge_pr", issue=issue_number, by=_me(),
                                   detail=f"已合并 PR #{pr_number}")
-    return ok(pr_number=pr_number, merged=True, sha=result.get("sha", ""),
-              message=(f"PR #{pr_number} 已合并（{method}）。"
-                       f"GitHub 会把 Issue 一并关闭，同步后卡片进 Done"))
+    tail = ("Issue 已标成 done 并关闭，卡片就在 Done 列了"
+            if finalized else
+            "Issue 的 done 标签没写成功（可能 Token 权限不足），卡片可以点 PR 面板里的"
+            "「标记完成并关闭 Issue」重试")
+    return ok(pr_number=pr_number, merged=True, finalized=finalized,
+              sha=result.get("sha", ""),
+              message=f"PR #{pr_number} 已合并（{method}）。{tail}")
+
+
+@app.route("/api/tasks/<int:issue_number>/pr/finalize", methods=["POST"])
+@auth.api_login_required
+def finalize_task_pr(issue_number: int):
+    """
+    **补一次收尾**：把已合并的 PR 对应的 Issue 标成 done 并关闭。
+
+    用于这些情况：PR 早就合了（例如在 GitHub 上直接合的，或者在这条规则上线之前合的），
+    Issue 却还开着 / 还挂着 doing，卡片赖在 Doing 列。只有组长能调用。
+    """
+    message = auth.check_lead(_me())
+    if message:
+        return _deny(auth.lead_only_message("标记完成"), "finalize_pr", issue_number)
+
+    task = database.get_task_by_issue(issue_number)
+    if not task:
+        return fail(f"本地不存在任务 #{issue_number}，请先执行同步", 404)
+    if not task.get("pr_number"):
+        return fail(f"#{issue_number} 还没有 PR，不需要收尾", 400)
+
+    # 没记成 merged 的话再问一次 GitHub，避免本地状态落后导致误操作
+    if task.get("pr_state") != "merged":
+        try:
+            pr = github_client.get_pull_request(int(task["pr_number"]))
+        except GitHubError as exc:
+            return fail(f"读取 PR 状态失败：{exc.message}", exc.status_code or 502)
+        if pr.get("state") != "merged":
+            return fail(f"PR #{task['pr_number']} 还没合并（当前 {pr.get('state')}），先合并再说", 400)
+        database.update_task_pr(issue_number, pr_state="merged")
+
+    finalized = _finalize_merged_issue(issue_number, task.get("pr_number"),
+                                      why="组长手动补收尾（已合并的 PR）")
+    if not finalized:
+        return fail("写入 GitHub 失败：请检查 Token 是否有 Issues 读写权限", 502)
+
+    realtime.notify_tasks_changed("finalize_pr", issue=issue_number, by=_me(),
+                                  detail="已标记完成并关闭 Issue")
+    return ok(pr_number=task.get("pr_number"), status="done",
+              message=f"#{issue_number} 已标成 done 并关闭 Issue，卡片进 Done 了")
 
 
 @app.route("/api/tasks/restore-all", methods=["POST"])
@@ -1218,20 +1351,30 @@ def _pr_snapshot(task_number: int, branch: str, local: Optional[dict[str, Any]],
     :return: 归一化 PR；没有或超预算时返回 None
     """
     pr_number = (local or {}).get("pr_number")
+    branch = str(branch or (local or {}).get("branch") or "")
     if pr_number:
         if budget["used"] >= PR_SYNC_BUDGET:
             budget["hit"] = 1
             return None
         budget["used"] += 1
         try:
-            return github_client.get_pull_request(int(pr_number))
+            current = github_client.get_pull_request(int(pr_number))
         except GitHubError as exc:
             logger.warning("刷新 PR #%s 状态失败：%s", pr_number, exc.message)
-            return None
+            current = None
 
-    name = str(branch or (local or {}).get("branch") or "")
-    if name and name in pr_index:
-        return pr_index[name]
+        # 卡片上记的那个 PR 已经关了（但没合并）→ 同一分支上可能又开了一个新的，
+        # 这种情况要学会自己改认新的那个，否则卡片会一直指着作废的 PR。
+        if current and current.get("state") == "closed" and branch in pr_index:
+            newer = pr_index[branch]
+            if newer.get("number") != current.get("number"):
+                logger.info("卡片记的 PR #%s 已关闭，改认同一分支上更新的 PR #%s",
+                            pr_number, newer.get("number"))
+                return newer
+        return current
+
+    if branch and branch in pr_index:
+        return pr_index[branch]
     return None
 
 
@@ -1263,6 +1406,7 @@ def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[s
     review_requests = 0
     review_budget_hit = False
     pr_budget = {"used": 0, "hit": 0}
+    merged_not_done: list[int] = []
     changes: list[dict[str, Any]] = []
     valid_numbers: list[int] = []
 
@@ -1325,6 +1469,11 @@ def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[s
                 "pr_head": pr.get("head") or "",
             }
             pr_count += 1
+            # 「PR 已合并、卡片却还没进 Done」= 漏了收尾（合并时写 GitHub 失败、
+            # 或者是在这条规则上线之前合的）。同步只读 GitHub，不替用户改状态，
+            # 但要把它列出来，提醒组长点一下「标记完成并关闭 Issue」。
+            if remote_pr["pr_state"] == "merged" and status != "done":
+                merged_not_done.append(number)
 
         # 远端派生值（None 表示“这一次没有拿到/不修改”，不参与比较）
         remote: dict[str, Any] = {
@@ -1439,6 +1588,9 @@ def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[s
     if pr_budget["hit"]:
         logger.warning("本次同步已达 PR 状态刷新预算（%d 个），其余卡片本轮不刷新 PR",
                        PR_SYNC_BUDGET)
+    if merged_not_done:
+        logger.warning("以下任务的 PR 已合并但状态还不是 done，需要组长补收尾：%s",
+                       "、".join(f"#{n}" for n in merged_not_done))
 
     return {
         "total": len(valid_numbers),
@@ -1450,6 +1602,7 @@ def _run_sync(with_meta: bool, prune: bool, with_reviews: bool = True) -> dict[s
         "reviewed": reviewed_count,
         "review_requests": review_requests,
         "prs": pr_count,
+        "merged_not_done": merged_not_done,
         "changes": changes,
         "with_meta": with_meta,
         "with_reviews": with_reviews,
