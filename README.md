@@ -669,17 +669,29 @@ python tools/test_ws.py     # 离线，不需要 Token；用真服务器 + 真 W
 不连后端、不写文件），然后模拟输入、`↑` `↓`、`Enter`、`Esc`、点外部、点恢复按钮、
 点开/关闭弹窗、推一条 WebSocket 事件，断言下拉结构、`<mark>` 高亮、卡片闪烁、页脚计数、
 每个圆圈 i 的 `data-hint` 是否齐全、`.active`/`.closing` 弹窗状态、在线名单与重连、
-已完成的任务是否真的拖不动、未分配的卡片拖走时是否一次请求带上「认领 + 新状态」等 80 项：
+已完成的任务是否真的拖不动、未分配的卡片拖走时是否一次请求带上「认领 + 新状态」、
+卡片编辑器粘代码后提交体是否正确等 **126 项**：
 
 ```bash
 npm install jsdom          # 只需一次（node_modules 已被 .gitignore 忽略）
 node tools/test_ui.js
 ```
 
+### git push 连不上 github.com 时：走 API 推
+
+这台机器偶尔出现「`api.github.com` 正常、`github.com` 连不上」的情况，
+`git push` 会报 `Connection was reset` / `Could not connect to server`。
+这时不用等网络恢复，可以直接走 API 通道：
+
 ```bash
-npm install jsdom          # 只需一次（node_modules 已被 .gitignore 忽略）
-node tools/test_ui.js
+python tools/push_via_api.py            # 推当前分支（同名远端分支）
+python tools/push_via_api.py --dry-run  # 只看会做什么
 ```
+
+它用 Git Data API（blob → tree → commit → 更新 ref）推送，并且**逐字节复刻本地提交**
+（同样的 tree / parent / author / committer / 提交信息），所以远端那个 commit 的 SHA
+和本地完全一样 —— 推完不会产生分叉，`git status` 依旧干净。
+需要 `.env` 里的 Token 有 Contents 读写权限。
 
 ### 推送前自检：真名有没有混进 Git
 
