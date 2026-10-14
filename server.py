@@ -1281,6 +1281,12 @@ def allow_task_pr(issue_number: int):
     if not pr_number:
         return fail(f"#{issue_number} 还没有 PR，先提一个", 400)
 
+    # 已经放行过就别重复动作（双击按钮 / 网络重试都可能再来一次）
+    if task.get("pr_allowed"):
+        who = assignee_display(task.get("pr_allowed_by") or "") or task.get("pr_allowed_by") or "组长"
+        return ok(pr_number=pr_number, allowed=True, already=True,
+                  message=f"PR #{pr_number} 之前已经放行过了（{who}），可以直接合并")
+
     database.update_task_pr(issue_number, pr_allowed=1, pr_allowed_by=_me())
     note = "已在 PR 下留言" 
     try:
@@ -1410,13 +1416,25 @@ def merge_task_pr(issue_number: int):
             f"确实要合就勾上「强制合并」",
             "merge_pr", issue_number)
 
+    already_merged = False
     try:
         result = github_client.merge_pull_request(int(pr_number), method)
     except GitHubError as exc:
-        logger.error("合并 PR #%s 失败：%s", pr_number, exc.message)
-        database.log_operation(_me(), "merge_pr", issue_number=issue_number,
-                               result="error", detail=exc.message)
-        return fail(exc.message, exc.status_code or 502)
+        # 可能只是「已经合并过了」：双击按钮、网络重试、或者在 GitHub 网页上先合了。
+        # 这种情况下不该报错，接着把 Issue 的收尾补上就行。
+        try:
+            current = github_client.get_pull_request(int(pr_number))
+        except GitHubError:
+            current = {}
+        if current.get("state") == "merged":
+            already_merged = True
+            result = {"merged": True, "message": "之前已经合并过了", "sha": ""}
+            logger.info("PR #%s 早已合并，跳过合并、直接补收尾", pr_number)
+        else:
+            logger.error("合并 PR #%s 失败：%s", pr_number, exc.message)
+            database.log_operation(_me(), "merge_pr", issue_number=issue_number,
+                                   result="error", detail=exc.message)
+            return fail(exc.message, exc.status_code or 502)
 
     database.update_task_pr(issue_number, pr_state="merged")
 
@@ -1431,9 +1449,9 @@ def merge_task_pr(issue_number: int):
             if finalized else
             "Issue 的 done 标签没写成功（可能 Token 权限不足），卡片可以点 PR 面板里的"
             "「标记完成并关闭 Issue」重试")
-    return ok(pr_number=pr_number, merged=True, finalized=finalized,
-              sha=result.get("sha", ""),
-              message=f"PR #{pr_number} 已合并（{method}）。{tail}")
+    head = "这个 PR 之前就已经合并了。" if already_merged else f"PR #{pr_number} 已合并（{method}）。"
+    return ok(pr_number=pr_number, merged=True, finalized=finalized, already=already_merged,
+              sha=result.get("sha", ""), message=f"{head}{tail}")
 
 
 @app.route("/api/tasks/<int:issue_number>/pr/finalize", methods=["POST"])

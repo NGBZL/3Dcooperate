@@ -1574,15 +1574,41 @@ async function openPrForTask() {
     }
 }
 
+/**
+ * 包一层「点一次只发一次」：请求进行中把按钮禁用掉。
+ *
+ * 之前允许/合并按钮在请求飞行中还是可点的，手快点两下就会发两次
+ * （PR 下会出现两条「组长已放行」评论）。
+ */
+async function withBusy(button, label, task) {
+    if (!button) return;
+    button.disabled = true;
+    const original = button.textContent;
+    if (label) button.textContent = label;
+    try {
+        await task();
+    } finally {
+        button.textContent = original;
+        // 面板可能已经刷新过，按最新状态再决定禁用与否
+        if (prTask && el.prModal && el.prModal.classList.contains('active')) {
+            renderPrPanelState(prTask);
+        } else {
+            button.disabled = false;
+        }
+    }
+}
+
 /** 组长：放行 PR。 */
 async function allowPrForTask() {
     if (!prTask) return;
-    try {
-        const data = await api(`/api/tasks/${prTask.issue_number}/pr/allow`, { method: 'POST' });
-        await refreshAfterPrAction(data.message || '已放行');
-    } catch (error) {
-        // api() 已经提示过
-    }
+    await withBusy(el.btnPrAllow, '放行中…', async () => {
+        try {
+            const data = await api(`/api/tasks/${prTask.issue_number}/pr/allow`, { method: 'POST' });
+            await refreshAfterPrAction(data.message || '已放行');
+        } catch (error) {
+            // api() 已经提示过
+        }
+    });
 }
 
 /** 组长：合并 PR（必须先放行；Agent 过审是另一道闸门，可在面板上强制越过）。 */
@@ -1594,26 +1620,30 @@ async function mergePrForTask() {
         + '（合并后看板会把 Issue 标成 done 并关闭，卡片进 Done）' + note)) {
         return;
     }
-    try {
-        const data = await api(`/api/tasks/${prTask.issue_number}/pr/merge`, {
-            method: 'POST',
-            body: JSON.stringify({ force }),
-        });
-        await refreshAfterPrAction(data.message || '已合并');
-    } catch (error) {
-        // api() 已经提示过
-    }
+    await withBusy(el.btnPrMerge, '合并中…', async () => {
+        try {
+            const data = await api(`/api/tasks/${prTask.issue_number}/pr/merge`, {
+                method: 'POST',
+                body: JSON.stringify({ force }),
+            });
+            await refreshAfterPrAction(data.message || '已合并');
+        } catch (error) {
+            // api() 已经提示过
+        }
+    });
 }
 
 /** 组长：给「已合并但还没进 Done」的卡片补一次收尾。 */
 async function finalizePrForTask() {
     if (!prTask) return;
-    try {
-        const data = await api(`/api/tasks/${prTask.issue_number}/pr/finalize`, { method: 'POST' });
-        await refreshAfterPrAction(data.message || '已标记完成');
-    } catch (error) {
-        // api() 已经提示过
-    }
+    await withBusy(el.btnPrFinalize, '处理中…', async () => {
+        try {
+            const data = await api(`/api/tasks/${prTask.issue_number}/pr/finalize`, { method: 'POST' });
+            await refreshAfterPrAction(data.message || '已标记完成');
+        } catch (error) {
+            // api() 已经提示过
+        }
+    });
 }
 
 /* ============================================================

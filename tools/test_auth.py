@@ -432,6 +432,19 @@ check("放行后组长合并 → 200",
       lead_client.post("/api/tasks/903/pr/merge", json={}).status_code == 200)
 check("合并后 PR 状态是 merged",
       database.get_task_by_issue(903)["pr_state"] == "merged")
+check("重复点合并不会报错（当成已经合并）",
+      lead_client.post("/api/tasks/903/pr/merge", json={}).status_code == 200)
+check("重复放行不会重复留言（直接说已经放行过）",
+      lead_client.post("/api/tasks/903/pr/allow", json={}).get_json().get("already") is True)
+
+# 已经合并的 PR：合并接口不该再调用 GitHub 的 merge（避免误报失败）
+github_client.merge_pull_request = lambda number, method="squash": (_ for _ in ()).throw(
+    github_client.GitHubError("Pull Request is not mergeable", 405))
+github_client.get_pull_request = lambda number: {
+    "number": number, "state": "merged", "url": "https://example/pr", "head": "task/903-fix",
+    "base": "main", "merged": True, "title": "x", "draft": False, "mergeable": True}
+check("GitHub 说不可合并、但 PR 其实已合并 → 仍然算成功",
+      lead_client.post("/api/tasks/903/pr/merge", json={}).status_code == 200)
 
 print()
 print("[12] 合并闸门：Agent 过审 + 组长放行，两条都满足才合并；合并后自动进 Done")
